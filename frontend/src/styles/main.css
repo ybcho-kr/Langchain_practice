@@ -1,0 +1,127 @@
+/* ChatGPT 스타일 다크 테마 전역 스타일 */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+  background: #343541;
+  color: #ececf1;
+  min-height: 100vh;
+  overflow: hidden;
+}
+
+.container {
+  width: 100%;
+  height: 100vh;
+  background: #343541;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* 탭 컨텐츠 */
+.tab-content {
+  display: none;
+  height: 100%;
+  overflow: hidden;
+}
+
+.tab-content.active {
+  display: flex;
+  flex-direction: column;
+}
+
+/* 메인 레이아웃 (사이드바 + 컨텐츠) */
+.main-layout {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+  background: #343541;
+}
+
+.sidebar-container {
+  flex-shrink: 0;
+  width: 260px;
+  position: relative;
+  z-index: 100;
+}
+
+.main-content {
+  flex: 1;
+  overflow: hidden;
+  background: #343541;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 로딩 및 상태 */
+.loading {
+  text-align: center;
+  padding: 20px;
+  color: #8e8ea0;
+}
+
+.spinner {
+  border: 3px solid #565869;
+  border-top: 3px solid #10a37f;
+  border-radius: 50%;
+  width: 30px;
+  height: 30px;
+  animation: spin 1s linear infinite;
+  margin: 0 auto 10px;
+}
+
+@keyframes spin {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+.error {
+  background: #5a1a1a;
+  color: #ff6b6b;
+  padding: 15px;
+  border-radius: 6px;
+  margin: 10px 0;
+  border: 1px solid #7a2a2a;
+}
+
+.success {
+  background: #1a3a2a;
+  color: #4ade80;
+  padding: 15px;
+  border-radius: 6px;
+  margin: 10px 0;
+  border: 1px solid #2a4a3a;
+}
+
+/* 반응형 */
+@media (max-width: 768px) {
+  .sidebar-container {
+    position: fixed;
+    left: -260px;
+    transition: left 0.3s ease;
+    z-index: 1000;
+    height: 100vh;
+  }
+
+  .sidebar-container.open {
+    left: 0;
+  }
+
+  .main-content {
+    width: 100%;
+  }
+
+  .chat-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+

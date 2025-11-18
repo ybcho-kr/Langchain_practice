@@ -1,0 +1,296 @@
+/* ChatGPT 스타일 다크 테마 모달 */
+
+.modal {
+  display: flex;
+  position: fixed;
+  z-index: 1000;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+  background-color: rgba(0, 0, 0, 0.7);
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(2px);
+}
+
+.modal-content {
+  background-color: #40414f;
+  margin: 5% auto;
+  padding: 0;
+  border-radius: 12px;
+  width: 90%;
+  max-width: 1000px;
+  max-height: 80vh;
+  overflow: hidden;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  border: 1px solid #565869;
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-header {
+  background: #343541;
+  color: #ececf1;
+  padding: 20px 30px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid #565869;
+}
+
+.modal-header h2 {
+  margin: 0;
+  font-size: 1.5em;
+  color: #ececf1;
+  font-weight: 600;
+}
+
+.modal-body {
+  padding: 30px;
+  max-height: 60vh;
+  overflow-y: auto;
+  font-size: 1.1em;
+  color: #ececf1;
+  line-height: 1.6;
+  background: #40414f;
+}
+
+.modal-body::-webkit-scrollbar {
+  width: 10px;
+}
+
+.modal-body::-webkit-scrollbar-track {
+  background: #2d2d3a;
+}
+
+.modal-body::-webkit-scrollbar-thumb {
+  background: #565869;
+  border-radius: 5px;
+}
+
+.modal-body::-webkit-scrollbar-thumb:hover {
+  background: #6e6e80;
+}
+
+.modal-footer {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  padding: 20px 30px;
+  border-top: 1px solid #565869;
+  background: #343541;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.modal-actions button,
+.modal-footer button {
+  padding: 10px 20px;
+  border: none;
+  border-radius: 6px;
+  font-size: 1em;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-weight: 500;
+}
+
+.modal-actions .btn-confirm,
+.modal-footer .btn-confirm {
+  background: #ef4444;
+  color: white;
+}
+
+.modal-actions .btn-confirm:hover,
+.modal-footer .btn-confirm:hover {
+  background: #dc2626;
+}
+
+.modal-actions .btn-cancel,
+.modal-footer .btn-cancel {
+  background: #565869;
+  color: #ececf1;
+}
+
+.modal-actions .btn-cancel:hover,
+.modal-footer .btn-cancel:hover {
+  background: #6e6e80;
+}
+
+.modal-actions .btn-primary,
+.modal-footer .btn-primary {
+  background: #10a37f;
+  color: white;
+}
+
+.modal-actions .btn-primary:hover,
+.modal-footer .btn-primary:hover {
+  background: #0d8f6e;
+}
+
+.close {
+  color: #ececf1;
+  font-size: 28px;
+  font-weight: bold;
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.close:hover,
+.close:focus {
+  background: #565869;
+  opacity: 1;
+}
+
+/* 모달 내부 입력 요소 스타일 */
+.modal-body input,
+.modal-body select,
+.modal-body textarea {
+  background: #343541;
+  border: 1px solid #565869;
+  border-radius: 6px;
+  color: #ececf1;
+  padding: 10px;
+  font-size: 1em;
+  outline: none;
+  transition: all 0.2s;
+}
+
+.modal-body input:focus,
+.modal-body select:focus,
+.modal-body textarea:focus {
+  border-color: #10a37f;
+  background: #40414f;
+}
+
+.modal-body input::placeholder,
+.modal-body textarea::placeholder {
+  color: #8e8ea0;
+}
+
+.modal-body label {
+  color: #8e8ea0;
+  font-size: 0.9em;
+  margin-bottom: 8px;
+  display: block;
+}
+
+.modal-body strong {
+  color: #ececf1;
+  font-weight: 600;
+}
+
+.modal-body p {
+  color: #ececf1;
+  margin: 12px 0;
+}
+
+.modal-body pre {
+  background: #2d2d3a;
+  padding: 15px;
+  border-radius: 6px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  font-family: 'Courier New', monospace;
+  font-size: 0.9em;
+  color: #ececf1;
+  border: 1px solid #565869;
+}
+
+.modal-body code {
+  background: #2d2d3a;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'Courier New', monospace;
+  font-size: 0.9em;
+  color: #10a37f;
+}
+
+.modal-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 15px 0;
+  background: #343541;
+  border: 1px solid #565869;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.modal-body th,
+.modal-body td {
+  padding: 12px;
+  text-align: left;
+  border-bottom: 1px solid #565869;
+  color: #ececf1;
+}
+
+.modal-body th {
+  background: #2d2d3a;
+  font-weight: 600;
+  color: #ececf1;
+}
+
+.modal-body tr:last-child td {
+  border-bottom: none;
+}
+
+.modal-body tr:hover {
+  background: #343541;
+}
+
+/* 모달 내부 정보 박스 */
+.modal-chunk-info {
+  margin-bottom: 20px;
+  padding: 15px;
+  background: #2d2d3a;
+  border-radius: 6px;
+  border: 1px solid #565869;
+  color: #ececf1;
+  font-size: 0.95em;
+  line-height: 1.8;
+}
+
+.modal-chunk-info strong {
+  color: #ececf1;
+  font-weight: 600;
+  margin-right: 8px;
+}
+
+.modal-chunk-info br {
+  margin: 4px 0;
+}
+
+@media (max-width: 768px) {
+  .modal-content {
+    width: 95%;
+    margin: 2% auto;
+    max-height: 90vh;
+  }
+
+  .modal-body {
+    padding: 20px;
+    max-height: 70vh;
+  }
+
+  .modal-header {
+    padding: 15px 20px;
+  }
+
+  .modal-footer {
+    padding: 15px 20px;
+  }
+}
