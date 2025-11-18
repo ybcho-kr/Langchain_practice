@@ -1080,30 +1080,40 @@ class QdrantVectorStore:
             for result in sorted_results:
                 point = result['point']
                 payload = point.payload or {}
+                nested_metadata = payload.get('metadata', {}) or {}
+                base_payload_metadata = {k: v for k, v in payload.items() if k != 'metadata'}
+                merged_metadata = {**base_payload_metadata, **nested_metadata}
+
                 # LangChain QdrantVectorStore는 기본적으로 'page_content' 키를 사용하지만,
                 # 우리가 저장할 때는 DocumentChunk의 content를 그대로 저장하므로
                 # payload에서 직접 텍스트를 가져오거나, metadata에서 가져와야 함
                 # LangChain의 기본 동작을 따라 'page_content' 키를 먼저 확인
-                page_content = payload.get('page_content', '')
+                page_content = merged_metadata.get('page_content', '')
                 if not page_content:
-                    # 'page_content'가 없으면 payload의 다른 키들을 확인
-                    # 또는 metadata에서 가져오기
+                    # 'page_content'가 없으면 payload나 metadata의 다른 키들을 확인
                     for key in ['content', 'text', 'body']:
-                        if key in payload:
-                            page_content = payload[key]
+                        if key in merged_metadata:
+                            page_content = merged_metadata[key]
                             break
-                
+
+                metadata = {
+                    'chunk_id': merged_metadata.get('chunk_id', ''),
+                    'source_file': merged_metadata.get('source_file', ''),
+                    'chunk_index': merged_metadata.get('chunk_index', 0),
+                    'table_title': merged_metadata.get('table_title', ''),
+                    'is_table_data': merged_metadata.get('is_table_data', False),
+                    **{k: v for k, v in merged_metadata.items()
+                       if k not in ['page_content', 'chunk_id', 'source_file', 'chunk_index', 'table_title', 'is_table_data']}
+                }
+
+                self.logger.debug(
+                    "하이브리드 검색 변환 메타데이터 병합 결과 | chunk_id=%s, source_file=%s, chunk_index=%s",
+                    metadata.get('chunk_id'), metadata.get('source_file'), metadata.get('chunk_index')
+                )
+
                 doc = Document(
                     page_content=page_content,
-                    metadata={
-                        'chunk_id': payload.get('chunk_id', ''),
-                        'source_file': payload.get('source_file', ''),
-                        'chunk_index': payload.get('chunk_index', 0),
-                        'table_title': payload.get('table_title', ''),
-                        'is_table_data': payload.get('is_table_data', False),
-                        **{k: v for k, v in payload.items() 
-                           if k not in ['page_content', 'chunk_id', 'source_file', 'chunk_index', 'table_title', 'is_table_data']}
-                    }
+                    metadata=metadata
                 )
                 # 결합된 점수 사용
                 docs.append((doc, result['combined_score']))
