@@ -518,12 +518,6 @@ class QdrantVectorStore:
         
         # 기본값 적용
         limit = limit if limit is not None else self.default_limit
-        # score_threshold는 호출하는 쪽에서 항상 전달되므로 None 체크만 수행
-        if score_threshold is None:
-            # RAG 설정에서 기본값 가져오기 (호환성)
-            from src.utils.config import get_rag_config
-            rag_config = get_rag_config()
-            score_threshold = rag_config.score_threshold
         
         try:
             filter_conditions = None
@@ -614,7 +608,7 @@ class QdrantVectorStore:
                 })
             
             # 점수 임계값 필터링
-            if score_threshold > 0:
+            if score_threshold is not None and score_threshold > 0:
                 before_filter_count = len(results)
                 results = [r for r in results if r['score'] >= score_threshold]
                 filtered_out = before_filter_count - len(results)
@@ -673,10 +667,6 @@ class QdrantVectorStore:
         
         # 기본값 적용
         limit = limit if limit is not None else self.default_limit
-        if score_threshold is None:
-            from src.utils.config import get_rag_config
-            rag_config = get_rag_config()
-            score_threshold = rag_config.score_threshold
         
         try:
             filter_conditions = None
@@ -789,7 +779,7 @@ class QdrantVectorStore:
                 })
             
             # 점수 임계값 필터링
-            if score_threshold > 0:
+            if score_threshold is not None and score_threshold > 0:
                 before_filter_count = len(results)
                 results = [r for r in results if r['score'] >= score_threshold]
                 filtered_out = before_filter_count - len(results)

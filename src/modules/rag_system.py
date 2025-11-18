@@ -3,7 +3,7 @@ RAG 시스템 모듈
 문서 처리, 임베딩, 벡터 검색, 답변 생성을 통합한 RAG 시스템
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import time
 
@@ -28,6 +28,25 @@ class RAGResponse:
     model_used: str
     is_general_answer: bool = False  # 일반 답변 여부
     is_rag_answer: bool = True  # RAG 답변 여부 (기본값 True)
+
+
+@dataclass
+class ThresholdDecision:
+    """질문별 score_threshold 결정 흐름 기록"""
+
+    base_threshold: float
+    base_reason: str
+    adjustments: List[Tuple[float, str]]
+    final_threshold: float
+
+    @property
+    def formula(self) -> str:
+        parts = [f"{self.base_threshold:.3f} ({self.base_reason})"]
+        for delta, reason in self.adjustments:
+            sign = "+" if delta >= 0 else "-"
+            parts.append(f"{sign}{abs(delta):.3f} ({reason})")
+        parts.append(f"= {self.final_threshold:.3f}")
+        return " ".join(parts)
 
 
 class RAGSystem:
@@ -525,18 +544,21 @@ class RAGSystem:
         try:
             self.logger.info(f"비동기 질의 처리 시작: {question[:50]}...")
             
-            # 기본값 적용
+            # 기본값 적용 및 단일화된 임계값 결정
             max_sources = max_sources if max_sources is not None else self.rag_config.default_max_sources
-            base_threshold = score_threshold if score_threshold is not None else self.rag_config.score_threshold
-            
-            # 동적 임계값 조정
-            score_threshold = self._calculate_dynamic_threshold(
+            decision = self._build_threshold_decision(
                 question=question,
-                base_threshold=base_threshold,
-                max_sources=max_sources
+                max_sources=max_sources,
+                requested_threshold=score_threshold
             )
-            
-            self.logger.info(f"문서 검색 파라미터: max_sources={max_sources}, score_threshold={score_threshold:.3f} (기본값: {base_threshold:.3f})")
+            score_threshold = decision.final_threshold
+
+            self.logger.info(
+                "문서 검색 파라미터: max_sources=%s, score_threshold=%.3f (계산식: %s)",
+                max_sources,
+                score_threshold,
+                decision.formula,
+            )
             
             # 모델 변경 처리
             if model_name and model_name != self.llm_client.model_name:
@@ -909,60 +931,97 @@ class RAGSystem:
                 model_used=""
             )
     
-    def _calculate_dynamic_threshold(self, question: str, base_threshold: float, max_sources: int) -> float:
+    def _build_threshold_decision(self, question: str, max_sources: int, requested_threshold: Optional[float]) -> ThresholdDecision:
+        """
+        요청별 점수 임계값을 단일한 경로에서 결정하고 기록합니다.
+
+        결정 흐름:
+        1. API 파라미터로 전달된 `requested_threshold`를 우선 사용
+        2. 값이 없으면 설정 기본값(`rag_config.score_threshold`) 적용
+        3. 질문/요청 특성을 기반으로 `_calculate_dynamic_threshold`에서 동적 보정
+        """
+
+        base_threshold = requested_threshold if requested_threshold is not None else self.rag_config.score_threshold
+        base_reason = "API" if requested_threshold is not None else "config"
+        adjustments: List[Tuple[float, str]] = []
+
+        final_threshold = self._calculate_dynamic_threshold(
+            question=question,
+            base_threshold=base_threshold,
+            max_sources=max_sources,
+            adjustments=adjustments,
+        )
+
+        return ThresholdDecision(
+            base_threshold=base_threshold,
+            base_reason=base_reason,
+            adjustments=adjustments,
+            final_threshold=final_threshold,
+        )
+
+    def _calculate_dynamic_threshold(self, question: str, base_threshold: float, max_sources: int, adjustments: Optional[List[Tuple[float, str]]] = None) -> float:
         """
         동적 임계값 계산
-        
+
         질문 유형과 요청된 문서 수에 따라 임계값을 조정합니다.
-        
+
         Args:
             question: 사용자 질문
             base_threshold: 기본 임계값
             max_sources: 요청된 최대 소스 수
-            
+            adjustments: 적용된 보정 내역을 기록할 리스트
+
         Returns:
             조정된 임계값
         """
         threshold = base_threshold
-        
+        adjustments = adjustments if adjustments is not None else []
+
         # 1. 질문 길이에 따른 조정 (짧은 질문은 더 엄격하게)
         question_length = len(question.strip())
         if question_length < 10:
-            # 매우 짧은 질문: 임계값 증가 (더 관련성 높은 결과만)
-            threshold += 0.1
+            delta = 0.1
+            threshold += delta
+            adjustments.append((delta, "짧은 질문(<10자)"))
         elif question_length > 50:
-            # 긴 질문: 임계값 감소 (더 많은 결과 포함)
-            threshold -= 0.05
-        
+            delta = -0.05
+            threshold += delta
+            adjustments.append((delta, "긴 질문(>50자)"))
+
         # 2. 요청된 문서 수에 따른 조정
         if max_sources <= 3:
-            # 적은 수의 문서 요청: 임계값 증가 (고품질만)
-            threshold += 0.1
+            delta = 0.1
+            threshold += delta
+            adjustments.append((delta, "적은 문서 요청(≤3)"))
         elif max_sources >= 10:
-            # 많은 수의 문서 요청: 임계값 감소 (더 넓은 범위)
-            threshold -= 0.1
-        
+            delta = -0.1
+            threshold += delta
+            adjustments.append((delta, "많은 문서 요청(≥10)"))
+
         # 3. 질문 유형에 따른 조정
         question_lower = question.lower()
-        
+
         # 키워드 기반 질문 (예: "변압기 진단 기준")
         if any(keyword in question_lower for keyword in ['기준', '방법', '절차', '과정', '원리']):
-            # 구체적인 정보 요청: 임계값 약간 감소
-            threshold -= 0.05
-        
+            delta = -0.05
+            threshold += delta
+            adjustments.append((delta, "구체 정보 요청 키워드"))
+
         # 비교/분석 질문 (예: "차이점", "비교")
         if any(keyword in question_lower for keyword in ['차이', '비교', '분석', '대비']):
-            # 여러 문서 비교 필요: 임계값 감소
-            threshold -= 0.1
-        
+            delta = -0.1
+            threshold += delta
+            adjustments.append((delta, "비교/분석 질문"))
+
         # 표/데이터 질문
         if any(keyword in question_lower for keyword in ['표', 'table', '데이터', '수치']):
-            # 표 데이터는 정확한 매칭 필요: 임계값 유지 또는 약간 증가
-            threshold += 0.05
-        
+            delta = 0.05
+            threshold += delta
+            adjustments.append((delta, "표/데이터 질문"))
+
         # 임계값 범위 제한 (0.0 ~ 1.0)
         threshold = max(0.0, min(1.0, threshold))
-        
+
         return threshold
     
     def _estimate_tokens(self, text: str) -> int:
@@ -1412,9 +1471,19 @@ class RAGSystem:
             
             # 기본값 적용 (통일된 임계값 사용)
             max_sources = max_sources if max_sources is not None else self.rag_config.default_max_sources_table
-            score_threshold = score_threshold if score_threshold is not None else self.rag_config.score_threshold
-            
-            self.logger.info(f"표 제목 검색 파라미터: max_sources={max_sources}, score_threshold={score_threshold:.3f}")
+            decision = self._build_threshold_decision(
+                question=question or table_title,
+                max_sources=max_sources,
+                requested_threshold=score_threshold,
+            )
+            score_threshold = decision.final_threshold
+
+            self.logger.info(
+                "표 제목 검색 파라미터: max_sources=%s, score_threshold=%.3f (계산식: %s)",
+                max_sources,
+                score_threshold,
+                decision.formula,
+            )
             
             # 모델 변경 처리
             if model_name and model_name != self.llm_client.model_name:
@@ -1510,9 +1579,19 @@ class RAGSystem:
             
             # 기본값 적용 (통일된 임계값 사용)
             max_sources = max_sources if max_sources is not None else self.rag_config.default_max_sources_table
-            score_threshold = score_threshold if score_threshold is not None else self.rag_config.score_threshold
-            
-            self.logger.info(f"필터 검색 파라미터: max_sources={max_sources}, score_threshold={score_threshold:.3f}")
+            decision = self._build_threshold_decision(
+                question=question,
+                max_sources=max_sources,
+                requested_threshold=score_threshold,
+            )
+            score_threshold = decision.final_threshold
+
+            self.logger.info(
+                "필터 검색 파라미터: max_sources=%s, score_threshold=%.3f (계산식: %s)",
+                max_sources,
+                score_threshold,
+                decision.formula,
+            )
             
             # 모델 변경 처리
             if model_name and model_name != self.llm_client.model_name:
