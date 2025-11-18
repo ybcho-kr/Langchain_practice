@@ -1,16 +1,34 @@
-from typing import Dict, Any
+import threading
 import time
+from typing import Dict, Any
+
 from src.utils.logger import get_logger
+
+_rag_system_instance = None
+_rag_system_lock = threading.Lock()
 
 
 def _get_rag_system():
+    logger = get_logger()
     try:
         from src.api.main import get_rag_system  # type: ignore
         return get_rag_system()
     except Exception:
         # Lazy fallback creation to avoid circular import issues at import time
-        from src.modules.rag_system import RAGSystem  # type: ignore
-        return RAGSystem()
+        global _rag_system_instance
+        if _rag_system_instance is not None:
+            logger.debug("Reusing cached fallback RAGSystem instance.")
+            return _rag_system_instance
+
+        with _rag_system_lock:
+            if _rag_system_instance is None:
+                from src.modules.rag_system import RAGSystem  # type: ignore
+                logger.debug("Creating fallback RAGSystem instance.")
+                _rag_system_instance = RAGSystem()
+            else:
+                logger.debug("Fallback RAGSystem instance already created by another thread.")
+
+        return _rag_system_instance
 
 
 async def search_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -18,6 +36,7 @@ async def search_node(state: Dict[str, Any]) -> Dict[str, Any]:
     logger = get_logger()
     start_time = time.time()
     rag = _get_rag_system()
+    logger.debug(f"[search] Using RAG system instance id: {id(rag)}")
     question: str = state.get("question", "") or ""
     logger.debug(f"[search] Executing search for: {question[:50]}...")
 
