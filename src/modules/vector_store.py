@@ -742,7 +742,8 @@ class QdrantVectorStore:
                         limit=limit,
                         filter_conditions=filter_conditions,
                         dense_weight=effective_dense_weight,
-                        sparse_weight=effective_sparse_weight
+                        sparse_weight=effective_sparse_weight,
+                        score_threshold=score_threshold
                     )
                 else:
                     # 가중치가 제공되지 않으면 LangChain QdrantVectorStore 사용
@@ -878,12 +879,13 @@ class QdrantVectorStore:
                         k=limit
                     )
     
-    async def _hybrid_search_with_weights(self, 
-                                         query: str, 
+    async def _hybrid_search_with_weights(self,
+                                         query: str,
                                          limit: int,
                                          filter_conditions: Optional[Dict[str, Any]] = None,
                                          dense_weight: float = 0.7,
-                                         sparse_weight: float = 0.3) -> List[tuple]:
+                                         sparse_weight: float = 0.3,
+                                         score_threshold: Optional[float] = None) -> List[tuple]:
         """
         Qdrant 클라이언트를 직접 사용하여 동적 가중치로 하이브리드 검색 수행
         
@@ -1048,10 +1050,18 @@ class QdrantVectorStore:
                         combined_results[point_id]['sparse_score'] = point.score if hasattr(point, 'score') else 0.0
             
             # 가중치로 최종 점수 계산
+            threshold_value = score_threshold if score_threshold is not None else None
+
             for point_id, result in combined_results.items():
                 dense_score = result['dense_score']
                 sparse_score = result['sparse_score']
-                
+                point = result['point']
+                payload = point.payload or {}
+                metadata = self._get_metadata(payload)
+                chunk_id = metadata.get('chunk_id', '')
+                chunk_index = metadata.get('chunk_index', 0)
+                source_file = metadata.get('source_file', '')
+
                 # 가중치 결합: (Dense 점수 × dense_weight) + (Sparse 점수 × sparse_weight)
                 # 점수가 0인 경우 해당 검색에서 발견되지 않은 것이므로 가중치를 조정
                 if dense_score > 0 and sparse_score > 0:
@@ -1065,9 +1075,28 @@ class QdrantVectorStore:
                     combined_score = sparse_score * sparse_weight / (dense_weight + sparse_weight) if (dense_weight + sparse_weight) > 0 else sparse_score
                 else:
                     combined_score = 0.0
-                
+
                 result['combined_score'] = combined_score
-            
+
+                threshold_status = "PASS"
+                threshold_text = "N/A"
+                if threshold_value is not None and threshold_value > 0:
+                    threshold_status = "PASS" if combined_score >= threshold_value else "FILTERED"
+                    threshold_text = f"{threshold_value:.4f}"
+
+                self.logger.debug(
+                    "[HybridScore] chunk_id=%s | chunk_index=%s | source_file=%s | dense=%.4f | sparse=%.4f | combined=%.4f"
+                    " | threshold=%s | %s",
+                    chunk_id,
+                    chunk_index,
+                    source_file,
+                    dense_score,
+                    sparse_score,
+                    combined_score,
+                    threshold_text,
+                    threshold_status
+                )
+
             # 최종 점수 기준으로 정렬
             sorted_results = sorted(
                 combined_results.values(),
