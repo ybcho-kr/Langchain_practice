@@ -180,6 +180,23 @@ class QdrantVectorStore:
         if 'metadata' in payload:
             return payload['metadata']
         return payload
+
+    def _normalize_score(self, score: Optional[float], metric: Optional[Distance] = None) -> float:
+        """Qdrant 거리 점수를 유사도로 변환"""
+        if score is None:
+            return 0.0
+
+        metric = metric or self.distance_metric
+
+        if metric == Distance.COSINE:
+            # Cosine distance를 유사도로 변환 (거리가 0에 가까울수록 유사도가 1에 가까움)
+            return 1.0 - float(score)
+        if metric == Distance.EUCLIDEAN:
+            # 유클리드 거리를 0~1 범위의 유사도로 정규화
+            return 1.0 / (1.0 + float(score))
+
+        # 기타 메트릭은 변환 없이 반환
+        return float(score)
     
     def create_collection(self, force_recreate: bool = False) -> bool:
         """컬렉션 생성"""
@@ -677,6 +694,18 @@ class QdrantVectorStore:
             from src.utils.config import get_rag_config
             rag_config = get_rag_config()
             score_threshold = rag_config.score_threshold
+
+        # 거리 메트릭 스케일에 맞춰 임계값을 유사도 스케일로 정규화
+        normalized_score_threshold = self._normalize_score(score_threshold)
+        if score_threshold is not None:
+            self.logger.info(
+                f"점수 임계값 정규화: 입력={float(score_threshold):.4f} → 유사도 스케일={normalized_score_threshold:.4f}"
+            )
+        else:
+            self.logger.info(
+                f"점수 임계값 정규화: 입력=None → 유사도 스케일={normalized_score_threshold:.4f}"
+            )
+        score_threshold = normalized_score_threshold
         
         try:
             filter_conditions = None
@@ -1023,29 +1052,48 @@ class QdrantVectorStore:
             if dense_results and dense_results.points:
                 for point in dense_results.points:
                     point_id = str(point.id)
+                    dense_score_raw = float(point.score) if hasattr(point, 'score') else 0.0
+                    dense_score = self._normalize_score(dense_score_raw, self.distance_metric)
                     if point_id not in combined_results:
                         combined_results[point_id] = {
                             'point': point,
-                            'dense_score': point.score if hasattr(point, 'score') else 0.0,
+                            'dense_score_raw': dense_score_raw,
+                            'dense_score': dense_score,
+                            'sparse_score_raw': 0.0,
                             'sparse_score': 0.0,
                             'combined_score': 0.0
                         }
                     else:
-                        combined_results[point_id]['dense_score'] = point.score if hasattr(point, 'score') else 0.0
+                        combined_results[point_id]['dense_score_raw'] = dense_score_raw
+                        combined_results[point_id]['dense_score'] = dense_score
             
             # Sparse 결과 처리
             if sparse_results and sparse_results.points:
                 for point in sparse_results.points:
                     point_id = str(point.id)
+                    sparse_score_raw = float(point.score) if hasattr(point, 'score') else 0.0
+                    sparse_score = self._normalize_score(sparse_score_raw, self.distance_metric)
                     if point_id not in combined_results:
                         combined_results[point_id] = {
                             'point': point,
                             'dense_score': 0.0,
-                            'sparse_score': point.score if hasattr(point, 'score') else 0.0,
+                            'dense_score_raw': 0.0,
+                            'sparse_score_raw': sparse_score_raw,
+                            'sparse_score': sparse_score,
                             'combined_score': 0.0
                         }
                     else:
-                        combined_results[point_id]['sparse_score'] = point.score if hasattr(point, 'score') else 0.0
+                        combined_results[point_id]['sparse_score_raw'] = sparse_score_raw
+                        combined_results[point_id]['sparse_score'] = sparse_score
+
+            # 정규화 전/후 점수 예시 로그 (최대 3개)
+            sample_logs = list(combined_results.values())[:3]
+            for idx, sample in enumerate(sample_logs, 1):
+                self.logger.info(
+                    "점수 정규화 예시 "
+                    f"[{idx}]: Dense {sample.get('dense_score_raw', 0.0):.4f} → {sample.get('dense_score', 0.0):.4f}, "
+                    f"Sparse {sample.get('sparse_score_raw', 0.0):.4f} → {sample.get('sparse_score', 0.0):.4f}"
+                )
             
             # 가중치로 최종 점수 계산
             for point_id, result in combined_results.items():
