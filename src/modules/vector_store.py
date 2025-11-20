@@ -401,7 +401,32 @@ class QdrantVectorStore:
                         'source_file': doc.source_file,
                         'chunk_id': doc.chunk_id,  # 원본 chunk_id는 payload에 저장
                         'chunk_index': doc.chunk_index,
-                        **doc.metadata
+                        'doc_id': doc.doc_id,
+                        'section_id': doc.section_id,
+                        'chunk_type': doc.chunk_type,
+                        'heading_path': doc.heading_path,
+                        'page_start': doc.page_start,
+                        'page_end': doc.page_end,
+                        'language': doc.language,
+                        'domain': doc.domain,
+                        'embedding_version': doc.embedding_version,
+                        'document': doc.doc_metadata.to_dict() if doc.doc_metadata else {},
+                        'metadata': {
+                            **doc.metadata,
+                            'chunk_id': doc.chunk_id,
+                            'chunk_index': doc.chunk_index,
+                            'doc_id': doc.doc_id,
+                            'section_id': doc.section_id,
+                            'chunk_type': doc.chunk_type,
+                            'heading_path': doc.heading_path,
+                            'page_start': doc.page_start,
+                            'page_end': doc.page_end,
+                            'language': doc.language,
+                            'domain': doc.domain,
+                            'embedding_version': doc.embedding_version,
+                            'document': doc.doc_metadata.to_dict() if doc.doc_metadata else {},
+                        },
+                        **doc.metadata,
                     }
                 )
                 points.append(point)

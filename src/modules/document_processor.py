@@ -5,9 +5,10 @@
 import os
 import re
 import hashlib
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import markdown
 from docx import Document
 from unstructured.partition.auto import partition
@@ -23,6 +24,26 @@ from src.utils.config import get_data_config, get_embedding_config
 
 
 @dataclass
+class DocumentMetadata:
+    """문서 수준 메타데이터"""
+
+    doc_id: str
+    file_path: str
+    version: str
+    content_hash: str
+    tags: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'doc_id': self.doc_id,
+            'file_path': self.file_path,
+            'version': self.version,
+            'content_hash': self.content_hash,
+            'tags': self.tags,
+        }
+
+
+@dataclass
 class DocumentChunk:
     """문서 청크"""
     content: str
@@ -30,6 +51,16 @@ class DocumentChunk:
     chunk_id: str
     source_file: str
     chunk_index: int
+    doc_id: str
+    section_id: Optional[str] = None
+    chunk_type: str = "text"
+    heading_path: List[str] = field(default_factory=list)
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
+    language: Optional[str] = None
+    domain: Optional[str] = None
+    embedding_version: Optional[str] = None
+    doc_metadata: Optional[DocumentMetadata] = None
 
 
 class DocumentProcessor:
@@ -39,9 +70,30 @@ class DocumentProcessor:
         self.logger = get_logger()
         self.config = get_data_config()
         self.supported_extensions = {'.md', '.docx', '.txt', '.pdf'}
-        
+        self.default_language = getattr(self.config, 'language', None) or 'unknown'
+        self.default_domain = getattr(self.config, 'domain', None) or 'general'
+        embedding_config = get_embedding_config()
+        self.embedding_version = getattr(embedding_config, 'name', None) or getattr(embedding_config, 'model_path', '')
+        self.current_document_metadata: Optional[DocumentMetadata] = None
+
         # 파일 해시 캐시 (중복 처리 방지)
         self.file_hashes = {}
+
+    def _build_document_metadata(self, file_path: Path) -> DocumentMetadata:
+        """문서 수준 메타데이터 생성"""
+        content_hash = self._calculate_file_hash(file_path)
+        version = datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
+        tags = [file_path.suffix.lstrip('.')] if file_path.suffix else []
+        doc_id_source = f"{file_path.resolve()}::{content_hash}"
+        doc_id = hashlib.md5(doc_id_source.encode('utf-8')).hexdigest()
+
+        return DocumentMetadata(
+            doc_id=doc_id,
+            file_path=str(file_path),
+            version=version,
+            content_hash=content_hash,
+            tags=tags,
+        )
     
     def _calculate_file_hash(self, file_path: Path) -> str:
         """파일 해시 계산"""
@@ -65,8 +117,85 @@ class DocumentProcessor:
         if self.file_hashes[file_key] != current_hash:
             self.file_hashes[file_key] = current_hash
             return True
-        
+
         return False
+
+    def _build_section_id(self, heading_path: List[str]) -> Optional[str]:
+        """헤딩 경로를 기반으로 섹션 ID 생성"""
+        if not heading_path:
+            return None
+
+        heading_str = '/'.join([h for h in heading_path if h])
+        if not heading_str:
+            return None
+
+        if self.current_document_metadata:
+            return f"{self.current_document_metadata.doc_id}:{heading_str}"
+
+        return heading_str
+
+    def _create_document_chunk(
+        self,
+        content: str,
+        file_path: Path,
+        chunk_index: int,
+        metadata: Dict[str, Any],
+        *,
+        heading_path: Optional[List[str]] = None,
+        section_id: Optional[str] = None,
+        chunk_type: str = 'text',
+        page_start: Optional[int] = None,
+        page_end: Optional[int] = None,
+        language: Optional[str] = None,
+        domain: Optional[str] = None,
+        chunk_id_override: Optional[str] = None,
+    ) -> DocumentChunk:
+        """DocumentChunk 생성 헬퍼"""
+        doc_meta = self.current_document_metadata or self._build_document_metadata(file_path)
+        heading_path = [h for h in (heading_path or []) if h]
+        resolved_section_id = section_id or self._build_section_id(heading_path)
+
+        merged_metadata = {
+            'file_name': file_path.name,
+            'file_path': str(file_path),
+            'file_size': file_path.stat().st_size,
+            'chunk_size': len(content),
+            'chunk_index': chunk_index,
+            'chunk_type': chunk_type,
+            'heading_path': heading_path,
+            'section_id': resolved_section_id,
+            'page_start': page_start,
+            'page_end': page_end,
+            'language': language or self.default_language,
+            'domain': domain or self.default_domain,
+            'embedding_version': self.embedding_version,
+            'doc_id': doc_meta.doc_id,
+            'document': doc_meta.to_dict(),
+            **metadata,
+        }
+
+        # None 값 제거하여 payload 간결화
+        merged_metadata = {k: v for k, v in merged_metadata.items() if v is not None}
+
+        chunk_id = chunk_id_override or f"{doc_meta.doc_id}_{chunk_index}"
+
+        return DocumentChunk(
+            content=content,
+            metadata=merged_metadata,
+            chunk_id=chunk_id,
+            source_file=str(file_path),
+            chunk_index=chunk_index,
+            doc_id=doc_meta.doc_id,
+            section_id=resolved_section_id,
+            chunk_type=chunk_type,
+            heading_path=heading_path,
+            page_start=page_start,
+            page_end=page_end,
+            language=language or self.default_language,
+            domain=domain or self.default_domain,
+            embedding_version=self.embedding_version,
+            doc_metadata=doc_meta,
+        )
     
     def process_file(self, file_path: Union[str, Path], force_process: bool = False) -> List[DocumentChunk]:
         """단일 파일 처리"""
@@ -77,21 +206,22 @@ class DocumentProcessor:
         
         if file_path.suffix.lower() not in self.supported_extensions:
             raise ValueError(f"지원하지 않는 파일 형식입니다: {file_path.suffix}")
-        
+
         # 파일 변경 확인 (중복 처리 방지)
         if not force_process and not self._is_file_changed(file_path):
             self.logger.info(f"파일이 변경되지 않음, 건너뛰기: {file_path}")
             return []
-        
+
         self.logger.info(f"파일 처리 시작: {file_path}")
-        
+        self.current_document_metadata = self._build_document_metadata(file_path)
+
         try:
             # 파일 형식에 따른 처리
             if file_path.suffix.lower() == '.md':
                 # md 파일은 헤더 계층 기반 청킹 처리
                 chunks = self._process_markdown_to_chunks(file_path)
                 self.logger.info(f"파일 처리 완료: {file_path}, 청크 수: {len(chunks)}")
-                return chunks            
+                return chunks
             elif file_path.suffix.lower() == '.docx':
                 # DOCX 파일은 의미 기반 청킹 사용 여부 확인
                 use_semantic_chunking = getattr(self.config, 'use_semantic_chunking_for_docx', False)
@@ -225,11 +355,6 @@ class DocumentProcessor:
             for i, chunk_text in enumerate(table_chunks):
                 # 메타데이터
                 md = {
-                    'file_name': file_path.name,
-                    'file_path': str(file_path),
-                    'file_size': file_path.stat().st_size,
-                    'chunk_size': len(chunk_text),
-                    'chunk_index': chunk_index,
                     'is_table_data': True,
                     'content_type': 'table',
                     'source': tdoc.metadata.get('source'),
@@ -240,13 +365,22 @@ class DocumentProcessor:
                     'table_title': table_title,
                 }
 
-                chunks.append(DocumentChunk(
-                    content=chunk_text,
-                    metadata=md,
-                    chunk_id=f"{file_path.stem}_{chunk_index}",
-                    source_file=str(file_path),
-                    chunk_index=chunk_index,
-                ))
+                heading_path = [
+                    md.get('heading'),
+                    md.get('sub-heading'),
+                    md.get('sub-sub-heading'),
+                ]
+
+                chunks.append(
+                    self._create_document_chunk(
+                        content=chunk_text,
+                        file_path=file_path,
+                        chunk_index=chunk_index,
+                        metadata=md,
+                        heading_path=heading_path,
+                        chunk_type='table',
+                    )
+                )
                 chunk_index += 1
 
         # 2) 일반 문서: 토크나이저 분할 사용 (실패 시 문자 분할)
@@ -266,11 +400,6 @@ class DocumentProcessor:
                 prefixed_content = f"### '{subject}'에 대한 설명입니다.\n\n" + re.sub(r'(?<!\.)\n', ' ', doc.page_content)
 
                 md = {
-                    'file_name': file_path.name,
-                    'file_path': str(file_path),
-                    'file_size': file_path.stat().st_size,
-                    'chunk_size': len(prefixed_content),
-                    'chunk_index': chunk_index,
                     'is_table_data': False,
                     'content_type': 'text',
                     'source': doc.metadata.get('source'),
@@ -280,13 +409,22 @@ class DocumentProcessor:
                     'subject': subject,
                 }
 
-                chunks.append(DocumentChunk(
-                    content=prefixed_content,
-                    metadata=md,
-                    chunk_id=f"{file_path.stem}_{chunk_index}",
-                    source_file=str(file_path),
-                    chunk_index=chunk_index,
-                ))
+                heading_path = [
+                    md.get('heading'),
+                    md.get('sub-heading'),
+                    md.get('sub-sub-heading'),
+                ]
+
+                chunks.append(
+                    self._create_document_chunk(
+                        content=prefixed_content,
+                        file_path=file_path,
+                        chunk_index=chunk_index,
+                        metadata=md,
+                        heading_path=heading_path,
+                        chunk_type='text',
+                    )
+                )
                 chunk_index += 1
 
         return chunks
@@ -1646,17 +1784,12 @@ class DocumentProcessor:
         """청크 객체 생성"""
         # 표 데이터 여부 확인 (더 정확한 패턴)
         is_table_data = "표 제목:" in content and "표 구조:" in content
-        
+
         metadata = {
-            'file_name': file_path.name,
-            'file_path': str(file_path),
-            'file_size': file_path.stat().st_size,
-            'chunk_size': len(content),
-            'chunk_index': chunk_index,
             'is_table_data': is_table_data,
             'content_type': 'table' if is_table_data else 'text'
         }
-        
+
         # 표 데이터인 경우 추가 메타데이터
         if is_table_data:
             # 표 제목 추출
@@ -1665,7 +1798,7 @@ class DocumentProcessor:
                 if line.startswith("표 제목:"):
                     metadata['table_title'] = line.replace("표 제목:", "").strip()
                     break
-            
+
             # 표 구조 정보 추출
             for line in lines:
                 if "총 행 수:" in line:
@@ -1674,13 +1807,13 @@ class DocumentProcessor:
                     if match:
                         metadata['table_rows'] = int(match.group(1))
                     break
-        
-        return DocumentChunk(
+
+        return self._create_document_chunk(
             content=content,
+            file_path=file_path,
+            chunk_index=chunk_index,
             metadata=metadata,
-            chunk_id=f"{file_path.stem}_{chunk_index}",
-            source_file=str(file_path),
-            chunk_index=chunk_index
+            chunk_type='table' if is_table_data else 'text',
         )
     
     def process_directory(self, directory_path: Union[str, Path], force_process: bool = False) -> List[DocumentChunk]:
@@ -1844,12 +1977,20 @@ class DocumentProcessor:
                     'sub-sub-heading': sentence_metadata_list[semantic_chunk.start_sentence_idx]['sub_sub_heading'] if semantic_chunk.start_sentence_idx < len(sentence_metadata_list) else None
                 }
                 
-                chunk = DocumentChunk(
+                heading_path = [
+                    chunk_metadata.get('heading'),
+                    chunk_metadata.get('sub-heading'),
+                    chunk_metadata.get('sub-sub-heading'),
+                ]
+
+                chunk = self._create_document_chunk(
                     content=overlapping_content,
+                    file_path=file_path,
+                    chunk_index=i,
                     metadata=chunk_metadata,
-                    chunk_id=f"{file_path.stem}_semantic_{i}",
-                    source_file=str(file_path),
-                    chunk_index=i
+                    heading_path=heading_path,
+                    chunk_type='semantic',
+                    chunk_id_override=f"{self.current_document_metadata.doc_id}_semantic_{i}" if self.current_document_metadata else None,
                 )
                 document_chunks.append(chunk)
             
