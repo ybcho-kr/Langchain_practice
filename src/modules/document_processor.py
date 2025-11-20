@@ -5,6 +5,7 @@
 import os
 import re
 import hashlib
+import uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from langchain_core.documents import Document as LCDocument
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from transformers import AutoTokenizer
 
+from src.modules.manifest_manager import ManifestManager
 from src.utils.logger import get_logger, log_info, log_error
 from src.utils.config import get_data_config, get_embedding_config
 # semantic_chunker는 함수 내부에서 지연 import (순환 import 방지)
@@ -30,6 +32,24 @@ class DocumentChunk:
     chunk_id: str
     source_file: str
     chunk_index: int
+    doc_id: str = ""
+    content_hash: str = ""
+
+
+@dataclass
+class FileProcessPlan:
+    file_path: Path
+    doc_id: str
+    content_hash: str
+    mtime: float
+    status: str  # new, modified, unchanged
+
+
+@dataclass
+class DirectoryProcessResult:
+    chunks: List[DocumentChunk]
+    deleted_files: List[str]
+    file_status: Dict[str, str]
 
 
 class DocumentProcessor:
@@ -39,8 +59,11 @@ class DocumentProcessor:
         self.logger = get_logger()
         self.config = get_data_config()
         self.supported_extensions = {'.md', '.docx', '.txt', '.pdf'}
-        
-        # 파일 해시 캐시 (중복 처리 방지)
+
+        # Manifest 기반 변경 감지
+        self.manifest_manager = ManifestManager(Path(self.config.manifest_path))
+        self._current_doc_id: Optional[str] = None
+        self._current_content_hash: Optional[str] = None
         self.file_hashes = {}
     
     def _calculate_file_hash(self, file_path: Path) -> str:
@@ -65,37 +88,78 @@ class DocumentProcessor:
         if self.file_hashes[file_key] != current_hash:
             self.file_hashes[file_key] = current_hash
             return True
-        
+
         return False
+
+    def _calculate_content_hash(self, file_path: Path) -> str:
+        """파일 콘텐츠의 SHA256 해시 계산"""
+        try:
+            with open(file_path, 'rb') as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except Exception as e:
+            self.logger.error(f"콘텐츠 해시 계산 실패: {file_path}, 오류: {str(e)}")
+            return ""
+
+    def _generate_doc_id(self, file_path: Path, mtime: float) -> str:
+        """파일 경로와 수정 시간으로부터 결정적 doc_id 생성"""
+        base = f"{file_path}:{mtime}"
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, base))
+
+    def _analyze_file(self, file_path: Path) -> FileProcessPlan:
+        """Manifest와 비교하여 파일 처리 계획 생성"""
+        mtime = file_path.stat().st_mtime
+        content_hash = self._calculate_content_hash(file_path)
+        manifest_entry = self.manifest_manager.get_entry(file_path)
+
+        if manifest_entry:
+            if manifest_entry.get('content_hash') == content_hash:
+                doc_id = manifest_entry.get('doc_id', '')
+                status = 'unchanged'
+            else:
+                doc_id = self._generate_doc_id(file_path, mtime)
+                status = 'modified'
+        else:
+            doc_id = self._generate_doc_id(file_path, mtime)
+            status = 'new'
+
+        return FileProcessPlan(
+            file_path=file_path,
+            doc_id=doc_id,
+            content_hash=content_hash,
+            mtime=mtime,
+            status=status
+        )
     
-    def process_file(self, file_path: Union[str, Path], force_process: bool = False) -> List[DocumentChunk]:
-        """단일 파일 처리"""
+    def process_file(self, file_path: Union[str, Path], force_process: bool = False, plan: Optional[FileProcessPlan] = None) -> List[DocumentChunk]:
+        """단일 파일 처리 (manifest 기반 변경 감지 우선)"""
         file_path = Path(file_path)
-        
+
         if not file_path.exists():
             raise FileNotFoundError(f"파일을 찾을 수 없습니다: {file_path}")
-        
+
         if file_path.suffix.lower() not in self.supported_extensions:
             raise ValueError(f"지원하지 않는 파일 형식입니다: {file_path.suffix}")
-        
-        # 파일 변경 확인 (중복 처리 방지)
-        if not force_process and not self._is_file_changed(file_path):
-            self.logger.info(f"파일이 변경되지 않음, 건너뛰기: {file_path}")
+
+        plan = plan or self._analyze_file(file_path)
+
+        if plan.status == 'unchanged':
+            self.logger.info(f"Manifest 기준 변경 없음, 건너뜀: {file_path}")
             return []
-        
-        self.logger.info(f"파일 처리 시작: {file_path}")
-        
+
+        self._current_doc_id = plan.doc_id
+        self._current_content_hash = plan.content_hash
+
+        self.logger.info(f"파일 처리 시작({plan.status}): {file_path}, doc_id={plan.doc_id}")
+
         try:
             # 파일 형식에 따른 처리
             if file_path.suffix.lower() == '.md':
                 # md 파일은 헤더 계층 기반 청킹 처리
                 chunks = self._process_markdown_to_chunks(file_path)
-                self.logger.info(f"파일 처리 완료: {file_path}, 청크 수: {len(chunks)}")
-                return chunks            
             elif file_path.suffix.lower() == '.docx':
                 # DOCX 파일은 의미 기반 청킹 사용 여부 확인
                 use_semantic_chunking = getattr(self.config, 'use_semantic_chunking_for_docx', False)
-                
+
                 if use_semantic_chunking:
                     chunks = self._process_docx_with_semantic_chunking(file_path)
                 else:
@@ -109,13 +173,17 @@ class DocumentProcessor:
                 chunks = self._chunk_content(content, file_path)
             else:
                 raise ValueError(f"지원하지 않는 파일 형식: {file_path.suffix}")
-            
+
             self.logger.info(f"파일 처리 완료: {file_path}, 청크 수: {len(chunks)}")
+            self.manifest_manager.update_entry(file_path, plan.doc_id, plan.content_hash, plan.mtime)
             return chunks
-            
+
         except Exception as e:
             self.logger.error(f"파일 처리 실패: {file_path}, 오류: {str(e)}")
             raise
+        finally:
+            self._current_doc_id = None
+            self._current_content_hash = None
     
     def _process_markdown_to_chunks(self, file_path: Path) -> List[DocumentChunk]:
         """Markdown 파일을 헤더 계층 기반으로 청킹.
@@ -238,14 +306,18 @@ class DocumentProcessor:
                     'sub-sub-heading': tdoc.metadata.get('sub-sub-heading'),
                     'subject': tdoc.metadata.get('subject'),
                     'table_title': table_title,
+                    'doc_id': self._current_doc_id,
+                    'content_hash': self._current_content_hash,
                 }
 
                 chunks.append(DocumentChunk(
                     content=chunk_text,
                     metadata=md,
-                    chunk_id=f"{file_path.stem}_{chunk_index}",
+                    chunk_id=f"{self._current_doc_id or file_path.stem}_{chunk_index}",
                     source_file=str(file_path),
                     chunk_index=chunk_index,
+                    doc_id=self._current_doc_id or "",
+                    content_hash=self._current_content_hash or "",
                 ))
                 chunk_index += 1
 
@@ -278,14 +350,18 @@ class DocumentProcessor:
                     'sub-heading': doc.metadata.get('sub-heading'),
                     'sub-sub-heading': doc.metadata.get('sub-sub-heading'),
                     'subject': subject,
+                    'doc_id': self._current_doc_id,
+                    'content_hash': self._current_content_hash,
                 }
 
                 chunks.append(DocumentChunk(
                     content=prefixed_content,
                     metadata=md,
-                    chunk_id=f"{file_path.stem}_{chunk_index}",
+                    chunk_id=f"{self._current_doc_id or file_path.stem}_{chunk_index}",
                     source_file=str(file_path),
                     chunk_index=chunk_index,
+                    doc_id=self._current_doc_id or "",
+                    content_hash=self._current_content_hash or "",
                 ))
                 chunk_index += 1
 
@@ -1654,7 +1730,9 @@ class DocumentProcessor:
             'chunk_size': len(content),
             'chunk_index': chunk_index,
             'is_table_data': is_table_data,
-            'content_type': 'table' if is_table_data else 'text'
+            'content_type': 'table' if is_table_data else 'text',
+            'doc_id': self._current_doc_id,
+            'content_hash': self._current_content_hash,
         }
         
         # 표 데이터인 경우 추가 메타데이터
@@ -1678,26 +1756,38 @@ class DocumentProcessor:
         return DocumentChunk(
             content=content,
             metadata=metadata,
-            chunk_id=f"{file_path.stem}_{chunk_index}",
+            chunk_id=f"{self._current_doc_id or file_path.stem}_{chunk_index}",
             source_file=str(file_path),
-            chunk_index=chunk_index
+            chunk_index=chunk_index,
+            doc_id=self._current_doc_id or "",
+            content_hash=self._current_content_hash or "",
         )
     
-    def process_directory(self, directory_path: Union[str, Path], force_process: bool = False) -> List[DocumentChunk]:
-        """디렉토리 내 모든 파일 처리"""
+    def process_directory(self, directory_path: Union[str, Path], force_process: bool = False) -> DirectoryProcessResult:
+        """디렉토리 내 모든 파일 처리 (manifest 기반 증분 처리)"""
         directory_path = Path(directory_path)
-        
+
         if not directory_path.exists():
             raise FileNotFoundError(f"디렉토리를 찾을 수 없습니다: {directory_path}")
-        
-        all_chunks = []
+
+        all_chunks: List[DocumentChunk] = []
         processed_files = 0
         skipped_files = 0
-        
+        file_status: Dict[str, str] = {}
+        current_files = set()
+
         for file_path in directory_path.rglob('*'):
             if file_path.is_file() and file_path.suffix.lower() in self.supported_extensions:
+                current_files.add(str(file_path))
                 try:
-                    chunks = self.process_file(file_path, force_process)
+                    plan = self._analyze_file(file_path)
+                    file_status[str(file_path)] = plan.status
+
+                    if plan.status == 'unchanged':
+                        skipped_files += 1
+                        continue
+
+                    chunks = self.process_file(file_path, force_process, plan)
                     if chunks:
                         all_chunks.extend(chunks)
                         processed_files += 1
@@ -1706,10 +1796,32 @@ class DocumentProcessor:
                 except Exception as e:
                     self.logger.error(f"파일 처리 실패: {file_path}, 오류: {str(e)}")
                     continue
-        
-        self.logger.info(f"디렉토리 처리 완료: {directory_path}, 처리된 파일: {processed_files}, 건너뛴 파일: {skipped_files}, 총 청크 수: {len(all_chunks)}")
-        return all_chunks
-    
+
+        manifest_files = set(self.manifest_manager.list_files())
+        deleted_files = sorted(manifest_files - current_files)
+
+        for deleted in deleted_files:
+            file_status[deleted] = 'deleted'
+
+        self.logger.info(
+            f"디렉토리 처리 완료: {directory_path}, 처리된 파일: {processed_files}, "
+            f"건너뛴 파일: {skipped_files}, 삭제 대상: {len(deleted_files)}, 총 청크 수: {len(all_chunks)}"
+        )
+
+        return DirectoryProcessResult(
+            chunks=all_chunks,
+            deleted_files=deleted_files,
+            file_status=file_status
+        )
+
+    def mark_files_deleted(self, deleted_files: List[str]) -> None:
+        """삭제된 파일을 manifest에서 제거"""
+        if not deleted_files:
+            return
+
+        self.manifest_manager.remove_entries(deleted_files)
+        self.logger.info(f"Manifest에서 삭제된 파일 {len(deleted_files)}개를 제거했습니다.")
+
     def save_processed_chunks(self, chunks: List[DocumentChunk], output_dir: Union[str, Path]):
         """처리된 청크를 파일로 저장"""
         output_dir = Path(output_dir)
@@ -1841,15 +1953,19 @@ class DocumentProcessor:
                     'end_sentence_idx': semantic_chunk.end_sentence_idx,
                     'heading': sentence_metadata_list[semantic_chunk.start_sentence_idx]['heading'] if semantic_chunk.start_sentence_idx < len(sentence_metadata_list) else None,
                     'sub-heading': sentence_metadata_list[semantic_chunk.start_sentence_idx]['sub_heading'] if semantic_chunk.start_sentence_idx < len(sentence_metadata_list) else None,
-                    'sub-sub-heading': sentence_metadata_list[semantic_chunk.start_sentence_idx]['sub_sub_heading'] if semantic_chunk.start_sentence_idx < len(sentence_metadata_list) else None
+                    'sub-sub-heading': sentence_metadata_list[semantic_chunk.start_sentence_idx]['sub_sub_heading'] if semantic_chunk.start_sentence_idx < len(sentence_metadata_list) else None,
+                    'doc_id': self._current_doc_id,
+                    'content_hash': self._current_content_hash,
                 }
-                
+
                 chunk = DocumentChunk(
                     content=overlapping_content,
                     metadata=chunk_metadata,
-                    chunk_id=f"{file_path.stem}_semantic_{i}",
+                    chunk_id=f"{self._current_doc_id or file_path.stem}_semantic_{i}",
                     source_file=str(file_path),
-                    chunk_index=i
+                    chunk_index=i,
+                    doc_id=self._current_doc_id or "",
+                    content_hash=self._current_content_hash or "",
                 )
                 document_chunks.append(chunk)
             
@@ -1869,6 +1985,6 @@ class DocumentProcessor:
 def process_documents(input_dir: str, output_dir: str) -> List[DocumentChunk]:
     """문서 처리 함수"""
     processor = DocumentProcessor()
-    chunks = processor.process_directory(input_dir)
-    processor.save_processed_chunks(chunks, output_dir)
-    return chunks
+    result = processor.process_directory(input_dir)
+    processor.save_processed_chunks(result.chunks, output_dir)
+    return result.chunks
