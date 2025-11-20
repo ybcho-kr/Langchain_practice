@@ -32,6 +32,18 @@ class DocumentChunk:
     chunk_index: int
 
 
+@dataclass
+class CanonicalBlock:
+    """파일 유형 간 공통으로 사용하는 블록 표현"""
+
+    block_type: str  # heading, paragraph, list, table, code 등
+    text: str
+    heading_path: List[str]
+    order_in_doc: int
+    page: Optional[int] = None
+    extra: Optional[Dict[str, Any]] = None
+
+
 class DocumentProcessor:
     """문서 처리기"""
     
@@ -84,38 +96,428 @@ class DocumentProcessor:
             return []
         
         self.logger.info(f"파일 처리 시작: {file_path}")
-        
+
         try:
             # 파일 형식에 따른 처리
-            if file_path.suffix.lower() == '.md':
-                # md 파일은 헤더 계층 기반 청킹 처리
-                chunks = self._process_markdown_to_chunks(file_path)
-                self.logger.info(f"파일 처리 완료: {file_path}, 청크 수: {len(chunks)}")
-                return chunks            
-            elif file_path.suffix.lower() == '.docx':
-                # DOCX 파일은 의미 기반 청킹 사용 여부 확인
-                use_semantic_chunking = getattr(self.config, 'use_semantic_chunking_for_docx', False)
-                
-                if use_semantic_chunking:
-                    chunks = self._process_docx_with_semantic_chunking(file_path)
-                else:
-                    content = self._process_docx(file_path)
-                    chunks = self._chunk_content(content, file_path)
-            elif file_path.suffix.lower() == '.txt':
-                content = self._process_text(file_path)
-                chunks = self._chunk_content(content, file_path)
-            elif file_path.suffix.lower() == '.pdf':
-                content = self._process_pdf(file_path)
-                chunks = self._chunk_content(content, file_path)
+            suffix = file_path.suffix.lower()
+            if suffix == '.md':
+                blocks = self._parse_markdown_to_blocks(file_path)
+            elif suffix == '.docx':
+                blocks = self._parse_docx_to_blocks(file_path)
+            elif suffix == '.pdf':
+                blocks = self._parse_pdf_to_blocks(file_path)
+            elif suffix == '.txt':
+                blocks = [
+                    CanonicalBlock(
+                        block_type='paragraph',
+                        text=self._process_text(file_path),
+                        heading_path=[],
+                        order_in_doc=0,
+                        extra={'source': str(file_path)},
+                    )
+                ]
             else:
                 raise ValueError(f"지원하지 않는 파일 형식: {file_path.suffix}")
-            
+
+            chunks = self._chunk_canonical_blocks(blocks, file_path)
+
             self.logger.info(f"파일 처리 완료: {file_path}, 청크 수: {len(chunks)}")
             return chunks
             
         except Exception as e:
             self.logger.error(f"파일 처리 실패: {file_path}, 오류: {str(e)}")
             raise
+
+    def _parse_markdown_to_blocks(self, file_path: Path) -> List[CanonicalBlock]:
+        content = self._read_file_with_encoding(file_path)
+        lines = content.splitlines()
+
+        blocks: List[CanonicalBlock] = []
+        heading_stack: List[str] = []
+        order = 0
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+
+            heading_match = re.match(r'^(#{1,6})\s+(.*)', line)
+            if heading_match:
+                level = len(heading_match.group(1))
+                title = heading_match.group(2).strip()
+                heading_stack = heading_stack[: level - 1]
+                heading_stack.append(title)
+                blocks.append(
+                    CanonicalBlock(
+                        block_type='heading',
+                        text=title,
+                        heading_path=heading_stack.copy(),
+                        order_in_doc=order,
+                        extra={'level': level, 'source': str(file_path)},
+                    )
+                )
+                order += 1
+                i += 1
+                continue
+
+            if line.strip().startswith('```'):
+                fence = line.strip().strip('`').replace('```', '')
+                code_lines: List[str] = []
+                i += 1
+                while i < len(lines) and not lines[i].strip().startswith('```'):
+                    code_lines.append(lines[i])
+                    i += 1
+                i += 1
+                blocks.append(
+                    CanonicalBlock(
+                        block_type='code',
+                        text='\n'.join(code_lines).strip(),
+                        heading_path=heading_stack.copy(),
+                        order_in_doc=order,
+                        extra={'language': fence or None, 'source': str(file_path)},
+                    )
+                )
+                order += 1
+                continue
+
+            if '|' in line and i + 1 < len(lines) and re.search(r'-{3,}', lines[i + 1]):
+                table_lines = [line, lines[i + 1]]
+                i += 2
+                while i < len(lines) and lines[i].strip() and '|' in lines[i]:
+                    table_lines.append(lines[i])
+                    i += 1
+                blocks.append(
+                    CanonicalBlock(
+                        block_type='table',
+                        text='\n'.join(table_lines).strip(),
+                        heading_path=heading_stack.copy(),
+                        order_in_doc=order,
+                        extra={'source': str(file_path)},
+                    )
+                )
+                order += 1
+                continue
+
+            if re.match(r'^[\-*+]\s+', line.strip()):
+                list_lines = [line]
+                i += 1
+                while i < len(lines) and re.match(r'^[\-*+]\s+', lines[i].strip()):
+                    list_lines.append(lines[i])
+                    i += 1
+                blocks.append(
+                    CanonicalBlock(
+                        block_type='list',
+                        text='\n'.join(list_lines).strip(),
+                        heading_path=heading_stack.copy(),
+                        order_in_doc=order,
+                        extra={'source': str(file_path)},
+                    )
+                )
+                order += 1
+                continue
+
+            paragraph_lines = [line]
+            i += 1
+            while (
+                i < len(lines)
+                and lines[i].strip()
+                and not re.match(r'^(#{1,6})\s+', lines[i])
+                and not lines[i].strip().startswith('```')
+                and not ('|' in lines[i] and i + 1 < len(lines) and re.search(r'-{3,}', lines[i + 1]))
+                and not re.match(r'^[\-*+]\s+', lines[i].strip())
+            ):
+                paragraph_lines.append(lines[i])
+                i += 1
+
+            paragraph = '\n'.join(paragraph_lines).strip()
+            if paragraph:
+                blocks.append(
+                    CanonicalBlock(
+                        block_type='paragraph',
+                        text=paragraph,
+                        heading_path=heading_stack.copy(),
+                        order_in_doc=order,
+                        extra={'source': str(file_path)},
+                    )
+                )
+                order += 1
+
+            while i < len(lines) and not lines[i].strip():
+                i += 1
+
+        return blocks
+
+    def _parse_docx_to_blocks(self, file_path: Path) -> List[CanonicalBlock]:
+        doc = Document(file_path)
+        blocks: List[CanonicalBlock] = []
+        heading_stack: List[str] = []
+        order = 0
+
+        def heading_level(style_name: Optional[str]) -> Optional[int]:
+            if not style_name:
+                return None
+            m = re.match(r'Heading(\d)', style_name)
+            return int(m.group(1)) if m else None
+
+        for element in doc.element.body:
+            if element.tag.endswith('p'):
+                paragraph = next((p for p in doc.paragraphs if p._element == element), None)
+                if not paragraph or not paragraph.text.strip():
+                    continue
+                level = heading_level(paragraph.style.name if paragraph.style else None)
+                if level:
+                    heading_stack = heading_stack[: level - 1]
+                    heading_stack.append(paragraph.text.strip())
+                    blocks.append(
+                        CanonicalBlock(
+                            block_type='heading',
+                            text=paragraph.text.strip(),
+                            heading_path=heading_stack.copy(),
+                            order_in_doc=order,
+                            extra={'level': level, 'source': str(file_path)},
+                        )
+                    )
+                else:
+                    blocks.append(
+                        CanonicalBlock(
+                            block_type='paragraph',
+                            text=paragraph.text.strip(),
+                            heading_path=heading_stack.copy(),
+                            order_in_doc=order,
+                            extra={'source': str(file_path)},
+                        )
+                    )
+                order += 1
+            elif element.tag.endswith('tbl'):
+                table = next((t for t in doc.tables if t._element == element), None)
+                if not table:
+                    continue
+                rows = []
+                for row in table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    rows.append(' | '.join(cells))
+                table_text = '\n'.join(rows).strip()
+                if table_text:
+                    blocks.append(
+                        CanonicalBlock(
+                            block_type='table',
+                            text=table_text,
+                            heading_path=heading_stack.copy(),
+                            order_in_doc=order,
+                            extra={'source': str(file_path), 'page': None},
+                        )
+                    )
+                    order += 1
+
+        return blocks
+
+    def _parse_pdf_to_blocks(self, file_path: Path) -> List[CanonicalBlock]:
+        elements = partition(filename=str(file_path))
+        blocks: List[CanonicalBlock] = []
+        heading_stack: List[str] = []
+        order = 0
+
+        for element in elements:
+            category = getattr(element, 'category', '').lower()
+            text = str(element)
+            metadata = element.metadata.to_dict() if element.metadata else {}
+            page_number = metadata.get('page_number')
+            coords = metadata.get('coordinates')
+            extra = {'source': str(file_path), 'page_number': page_number, 'coordinates': coords}
+
+            if category == 'title':
+                level = metadata.get('category_depth', 1) if metadata else 1
+                heading_stack = heading_stack[: level - 1]
+                heading_stack.append(text.strip())
+                blocks.append(
+                    CanonicalBlock(
+                        block_type='heading',
+                        text=text.strip(),
+                        heading_path=heading_stack.copy(),
+                        order_in_doc=order,
+                        page=page_number,
+                        extra={**extra, 'level': level},
+                    )
+                )
+            elif category in {'table'}:
+                blocks.append(
+                    CanonicalBlock(
+                        block_type='table',
+                        text=text.strip(),
+                        heading_path=heading_stack.copy(),
+                        order_in_doc=order,
+                        page=page_number,
+                        extra=extra,
+                    )
+                )
+            elif category in {'list'}:
+                blocks.append(
+                    CanonicalBlock(
+                        block_type='list',
+                        text=text.strip(),
+                        heading_path=heading_stack.copy(),
+                        order_in_doc=order,
+                        page=page_number,
+                        extra=extra,
+                    )
+                )
+            elif category in {'code'}:
+                blocks.append(
+                    CanonicalBlock(
+                        block_type='code',
+                        text=text.strip(),
+                        heading_path=heading_stack.copy(),
+                        order_in_doc=order,
+                        page=page_number,
+                        extra=extra,
+                    )
+                )
+            else:
+                blocks.append(
+                    CanonicalBlock(
+                        block_type='paragraph',
+                        text=text.strip(),
+                        heading_path=heading_stack.copy(),
+                        order_in_doc=order,
+                        page=page_number,
+                        extra=extra,
+                    )
+                )
+            order += 1
+
+        return blocks
+
+    def _get_tokenizer(self) -> Optional[AutoTokenizer]:
+        if hasattr(self, '_cached_tokenizer'):
+            return self._cached_tokenizer
+
+        embedding_config = get_embedding_config()
+        tokenizer_model_path = embedding_config.model_path
+        if not tokenizer_model_path:
+            self.logger.warning("임베딩 모델 경로가 설정되지 않았습니다. 토크나이저 로드를 건너뜁니다.")
+            self._cached_tokenizer = None
+            return None
+
+        tokenizer_path = Path(tokenizer_model_path)
+        if tokenizer_path.exists() and tokenizer_path.is_dir():
+            tokenizer_model_path = str(tokenizer_path.resolve()).replace('\\', '/')
+
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_model_path,
+                local_files_only=False,
+                trust_remote_code=False,
+            )
+            self._cached_tokenizer = tokenizer
+            return tokenizer
+        except Exception as e:
+            self.logger.warning(f"토크나이저 로드 실패 ({tokenizer_model_path}): {str(e)}")
+            self._cached_tokenizer = None
+            return None
+
+    def _split_text_by_tokens(self, text: str, tokenizer: Optional[AutoTokenizer]) -> List[str]:
+        if tokenizer is None:
+            parts: List[str] = []
+            start = 0
+            while start < len(text):
+                end = min(len(text), start + self.config.chunk_size)
+                parts.append(text[start:end])
+                if end == len(text):
+                    break
+                next_start = max(0, end - self.config.chunk_overlap)
+                if next_start <= start:
+                    next_start = end
+                start = next_start
+            return parts if parts else [text]
+
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        parts: List[str] = []
+        start = 0
+        while start < len(tokens):
+            end = min(len(tokens), start + self.config.chunk_size)
+            decoded = tokenizer.decode(tokens[start:end])
+            parts.append(decoded)
+            if end == len(tokens):
+                break
+            next_start = max(end - self.config.chunk_overlap, 0)
+            if next_start <= start:
+                next_start = end
+            start = next_start
+        return parts
+
+    def _group_blocks_by_heading(self, blocks: List[CanonicalBlock]) -> List[Dict[str, Any]]:
+        sections: List[Dict[str, Any]] = []
+        current_path: List[str] = []
+        current_text: List[str] = []
+        order_start: Optional[int] = None
+        order_end: Optional[int] = None
+        pages: set = set()
+
+        def flush():
+            if current_text:
+                sections.append(
+                    {
+                        'heading_path': current_path.copy() or [''],
+                        'text': '\n\n'.join(current_text).strip(),
+                        'order_start': order_start,
+                        'order_end': order_end,
+                        'pages': sorted(pages),
+                    }
+                )
+
+        for block in blocks:
+            if block.block_type == 'heading':
+                flush()
+                current_path = block.heading_path.copy()
+                current_text = [block.text]
+                order_start = block.order_in_doc
+                order_end = block.order_in_doc
+                pages = set([block.page]) if block.page is not None else set()
+                continue
+
+            if order_start is None:
+                order_start = block.order_in_doc
+            order_end = block.order_in_doc
+            current_text.append(block.text)
+            if block.page is not None:
+                pages.add(block.page)
+
+        flush()
+        return sections
+
+    def _chunk_canonical_blocks(self, blocks: List[CanonicalBlock], file_path: Path) -> List[DocumentChunk]:
+        sections = self._group_blocks_by_heading(blocks)
+        tokenizer = self._get_tokenizer()
+        chunks: List[DocumentChunk] = []
+        chunk_index = 0
+
+        for section in sections:
+            section_text = section['text']
+            if not section_text:
+                continue
+
+            text_parts = self._split_text_by_tokens(section_text, tokenizer)
+            for part in text_parts:
+                metadata = {
+                    'file_name': file_path.name,
+                    'file_path': str(file_path),
+                    'heading_path': section['heading_path'],
+                    'section_title': ' > '.join([h for h in section['heading_path'] if h]),
+                    'block_order_start': section['order_start'],
+                    'block_order_end': section['order_end'],
+                    'pages': section.get('pages'),
+                }
+                chunks.append(
+                    DocumentChunk(
+                        content=part,
+                        metadata=metadata,
+                        chunk_id=f"{file_path.stem}_{chunk_index}",
+                        source_file=str(file_path),
+                        chunk_index=chunk_index,
+                    )
+                )
+                chunk_index += 1
+
+        return chunks
     
     def _process_markdown_to_chunks(self, file_path: Path) -> List[DocumentChunk]:
         """Markdown 파일을 헤더 계층 기반으로 청킹.
