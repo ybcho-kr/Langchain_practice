@@ -285,13 +285,25 @@ class RAGSystem:
             self.logger.info(f"문서 처리 시작: {input_dir}")
             
             # 1. 문서 처리
-            chunks = self.document_processor.process_directory(input_dir, force_update)
-            if not chunks:
+            process_result = self.document_processor.process_directory(input_dir, force_update)
+            chunks = process_result.chunks
+            deleted_files = process_result.deleted_files
+
+            if not chunks and not deleted_files:
                 self.logger.error("처리할 문서가 없습니다")
                 return False
-            
+
             self.logger.info(f"문서 청킹 완료: {len(chunks)}개 청크")
-            
+
+            # 1-1. 삭제 대상 자동 처리
+            if deleted_files:
+                for file_path in deleted_files:
+                    delete_result = self.delete_document(file_path)
+                    if delete_result.get('qdrant_success'):
+                        self.document_processor.mark_files_deleted([file_path])
+                    else:
+                        self.logger.warning(f"Qdrant 삭제 실패로 manifest는 유지됩니다: {file_path}")
+
             # 2. 벡터 저장소에 저장 (교체 모드 또는 일반 모드)
             # Sparse 벡터는 QdrantVectorStore.add_documents에서 자동으로 처리됨
             if replace_mode:
@@ -322,17 +334,27 @@ class RAGSystem:
             self.logger.info(f"비동기 문서 처리 시작: {input_dir}")
             
             # 1. 문서 처리 (I/O 작업 - 비동기화)
-            chunks = await asyncio.to_thread(
+            process_result = await asyncio.to_thread(
                 self.document_processor.process_directory,
                 input_dir,
                 force_update
             )
-            if not chunks:
+            chunks = process_result.chunks
+            deleted_files = process_result.deleted_files
+            if not chunks and not deleted_files:
                 self.logger.error("처리할 문서가 없습니다")
                 return False
-            
+
             self.logger.info(f"문서 청킹 완료: {len(chunks)}개 청크")
-            
+
+            if deleted_files:
+                for file_path in deleted_files:
+                    delete_result = await asyncio.to_thread(self.delete_document, file_path)
+                    if delete_result.get('qdrant_success'):
+                        self.document_processor.mark_files_deleted([file_path])
+                    else:
+                        self.logger.warning(f"Qdrant 삭제 실패로 manifest는 유지됩니다: {file_path}")
+
             # 2. 벡터 저장소에 저장 (I/O 작업 - 비동기화)
             if replace_mode:
                 # 교체 모드: 파일별로 완전 교체

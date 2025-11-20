@@ -72,6 +72,7 @@ class DataConfig(BaseModel):
     input_dir: str = "data/raw"
     processed_dir: str = "data/processed"
     embeddings_dir: str = "data/embeddings"
+    manifest_path: str = "data/manifest.json"
     chunk_size: int = 600 # 설정 파일의 기본값과 일치
     chunk_overlap: int = 60  # 설정 파일의 기본값과 일치
     batch_size: int = 32  # SSD 최적화를 위한 배치 크기 증가
