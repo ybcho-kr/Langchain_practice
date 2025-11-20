@@ -345,12 +345,14 @@ class BM25SparseEmbedding(SparseEmbeddings):
         
         return results
     
-    def embed_query(self, text: str) -> SparseVector:
+    def embed_query(self, text: str = None, keywords: Optional[List[str]] = None, entities: Optional[List[str]] = None) -> SparseVector:
         """
-        쿼리 텍스트에 대해 sparse 벡터 생성
+        쿼리 텍스트 또는 키워드/엔티티로 sparse 벡터 생성
         
         Args:
-            text: 쿼리 텍스트
+            text: 쿼리 텍스트 (하위 호환성 유지, keywords/entities가 없을 때만 사용)
+            keywords: query_refiner에서 추출한 키워드 리스트
+            entities: query_refiner에서 추출한 엔티티 리스트
             
         Returns:
             SparseVector: sparse 벡터
@@ -359,24 +361,54 @@ class BM25SparseEmbedding(SparseEmbeddings):
             self.logger.warning("BM25 모델이 학습되지 않았습니다. 빈 벡터를 반환합니다.")
             return SparseVector(indices=[], values=[])
         
-        tokens = self.preprocess_func(text)
-        
-        # 쿼리의 경우 단순히 토큰의 IDF를 사용
-        indices = []
-        values = []
-        
-        for token in set(tokens):  # 쿼리에서는 중복 제거
-            if token not in self.vocabulary:
-                continue
+        # keywords와 entities가 제공되면 직접 사용 (query_refiner에서 추출한 결과)
+        if keywords is not None or entities is not None:
+            all_tokens = []
+            if keywords:
+                all_tokens.extend(keywords)
+            if entities:
+                all_tokens.extend(entities)
             
-            token_idx = self.vocabulary[token]
-            idf = self.idf.get(token, 0.0)
+            # vocabulary에 있는 토큰만 필터링
+            indices = []
+            values = []
+            for token in set(all_tokens):  # 중복 제거
+                if token not in self.vocabulary:
+                    continue  # vocabulary에 없으면 제외
+                
+                token_idx = self.vocabulary[token]
+                idf = self.idf.get(token, 0.0)
+                
+                if idf > 0:
+                    indices.append(token_idx)
+                    values.append(float(idf))
             
-            if idf > 0:
-                indices.append(token_idx)
-                values.append(float(idf))
+            return SparseVector(indices=indices, values=values)
         
-        return SparseVector(indices=indices, values=values)
+        # 하위 호환성: text가 제공되면 기존 방식 사용
+        if text:
+            tokens = self.preprocess_func(text)
+            
+            # 쿼리의 경우 단순히 토큰의 IDF를 사용
+            indices = []
+            values = []
+            
+            for token in set(tokens):  # 쿼리에서는 중복 제거
+                if token not in self.vocabulary:
+                    continue
+                
+                token_idx = self.vocabulary[token]
+                idf = self.idf.get(token, 0.0)
+                
+                if idf > 0:
+                    indices.append(token_idx)
+                    values.append(float(idf))
+            
+            return SparseVector(indices=indices, values=values)
+        
+        # text도 keywords/entities도 없는 경우 빈 벡터 반환
+        self.logger.warning("text, keywords, entities 모두 제공되지 않았습니다. 빈 벡터를 반환합니다.")
+        return SparseVector(indices=[], values=[])
 
 
 class SparseEmbeddingManager:

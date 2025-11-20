@@ -22,6 +22,7 @@ export default function Documents() {
   const [chunksLoading, setChunksLoading] = useState(false);
   const [fullChunkModalOpen, setFullChunkModalOpen] = useState(false);
   const [selectedChunk, setSelectedChunk] = useState(null);
+  const [chunkSearchQuery, setChunkSearchQuery] = useState('');
 
   const { execute: loadDocuments, loading } = useDocuments();
   const { execute: deleteDocument, loading: deleteLoading } = useDeleteDocument();
@@ -94,8 +95,6 @@ export default function Documents() {
       if (response.success) {
         let message = `문서 삭제 완료!\n\n`;
         message += `✅ Qdrant: ${response.qdrant_deleted ? '삭제됨' : '실패'}\n`;
-        message += `✅ BM25: ${response.bm25_deleted ? '삭제됨' : '실패'}\n`;
-        message += `⚠️ FAISS: ${response.faiss_handled || response.faiss_deleted ? '처리됨 (재구축 필요)' : '재구축 필요'}\n`;
 
         if (response.warnings && response.warnings.length > 0) {
           message += `\n⚠️ 경고:\n`;
@@ -169,6 +168,7 @@ export default function Documents() {
           setChunkModalOpen(false);
           setSelectedDocumentId(null);
           setChunks(null);
+          setChunkSearchQuery('');
         }}
         title={`문서 청크 정보 - ${selectedDocumentId ? selectedDocumentId.split('\\').pop() : ''}`}
       >
@@ -184,34 +184,87 @@ export default function Documents() {
               <br />
               <strong>총 청크 수:</strong> {chunks.total_chunks}개
             </div>
+            
+            {/* 청크 검색 입력 필드 */}
+            <div className="chunk-search-container" style={{ marginBottom: '20px', marginTop: '15px' }}>
+              <input
+                type="text"
+                placeholder="청크 내용 검색..."
+                value={chunkSearchQuery}
+                onChange={(e) => setChunkSearchQuery(e.target.value)}
+                className="chunk-search-input"
+                style={{
+                  width: '100%',
+                  padding: '10px 15px',
+                  fontSize: '14px',
+                  background: '#2d2d3a',
+                  border: '1px solid #565869',
+                  borderRadius: '6px',
+                  color: '#ececf1',
+                  outline: 'none',
+                  transition: 'border-color 0.2s'
+                }}
+                onFocus={(e) => e.target.style.borderColor = '#10a37f'}
+                onBlur={(e) => e.target.style.borderColor = '#565869'}
+              />
+              {chunkSearchQuery && (
+                <div style={{ marginTop: '8px', fontSize: '0.9em', color: '#8e8ea0' }}>
+                  검색 결과: {
+                    chunks.chunks.filter(chunk => {
+                      const searchLower = chunkSearchQuery.toLowerCase();
+                      const content = (chunk.content_preview || '').toLowerCase();
+                      const fullContent = (chunk.content_full || '').toLowerCase();
+                      return content.includes(searchLower) || fullContent.includes(searchLower);
+                    }).length
+                  }개 / {chunks.chunks.length}개
+                </div>
+              )}
+            </div>
+            
             {chunks.chunks && chunks.chunks.length > 0 ? (
-              <div>
-                {chunks.chunks.map((chunk) => {
-                  const isTableData = chunk.content_preview?.includes('표 데이터') || false;
-                  return (
-                    <div key={chunk.chunk_id} className="chunk-item">
-                      <div className="chunk-header">
-                        <div className="chunk-title">청크 {chunk.chunk_index}</div>
-                        <div className="chunk-meta">
-                          ID: {chunk.chunk_id} | 길이: {chunk.content_length}자
-                          {isTableData && ' | 📊 표 데이터'}
+              (() => {
+                const filteredChunks = chunks.chunks.filter(chunk => {
+                  if (!chunkSearchQuery.trim()) return true;
+                  const searchLower = chunkSearchQuery.toLowerCase();
+                  const content = (chunk.content_preview || '').toLowerCase();
+                  const fullContent = (chunk.content_full || '').toLowerCase();
+                  return content.includes(searchLower) || fullContent.includes(searchLower);
+                });
+                
+                return filteredChunks.length > 0 ? (
+                  <div>
+                    {filteredChunks.map((chunk) => {
+                      const isTableData = chunk.content_preview?.includes('표 데이터') || false;
+                      return (
+                        <div key={chunk.chunk_id} className="chunk-item">
+                          <div className="chunk-header">
+                            <div className="chunk-title">청크 {chunk.chunk_index}</div>
+                            <div className="chunk-meta">
+                              ID: {chunk.chunk_id} | 길이: {chunk.content_length}자
+                              {isTableData && ' | 📊 표 데이터'}
+                            </div>
+                          </div>
+                          <div className="chunk-content">
+                            <pre>{chunk.content_preview}</pre>
+                          </div>
+                          <div className="chunk-actions">
+                            <button
+                              className="btn btn-primary btn-sm"
+                              onClick={() => handleViewFullChunk(chunk)}
+                            >
+                              📖 자세히 보기
+                            </button>
+                          </div>
                         </div>
-                      </div>
-                      <div className="chunk-content">
-                        <pre>{chunk.content_preview}</pre>
-                      </div>
-                      <div className="chunk-actions">
-                        <button
-                          className="btn btn-primary btn-sm"
-                          onClick={() => handleViewFullChunk(chunk)}
-                        >
-                          📖 자세히 보기
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div style={{ padding: '20px', textAlign: 'center', color: '#8e8ea0' }}>
+                    검색어 "{chunkSearchQuery}"에 해당하는 청크를 찾을 수 없습니다.
+                  </div>
+                );
+              })()
             ) : (
               <div>청크가 없습니다.</div>
             )}

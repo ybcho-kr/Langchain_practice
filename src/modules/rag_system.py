@@ -11,8 +11,7 @@ from src.utils.logger import get_logger
 from src.utils.config import get_config, get_rag_config
 from src.utils.helpers import is_general_question
 from src.modules.document_processor import DocumentProcessor, DocumentChunk
-from src.modules.embedding_module import EmbeddingManager
-from src.modules.vector_store import VectorStoreManager
+from src.modules.vector_store import QdrantVectorStore
 from src.models.llm_models import OllamaLLMClient
 from src.modules.reranker_module import CrossEncoderReranker
 
@@ -46,9 +45,8 @@ class RAGSystem:
         print(f"  LLM 모델: {self.config.model.get('llm', {}).name if 'llm' in config.model else 'N/A'}")
         # 모듈 초기화
         self.document_processor = DocumentProcessor()
-        # EmbeddingManager를 먼저 생성하고 VectorStoreManager에 전달하여 중복 로드 방지
-        self.embedding_manager = EmbeddingManager()
-        self.vector_store_manager = VectorStoreManager(config.qdrant, embedding_manager=self.embedding_manager)
+        # QdrantVectorStore 직접 사용
+        self.vector_store = QdrantVectorStore(config.qdrant, bge_model=None)
         
         # 리랭커 초기화 (설정 기반)
         self.reranker: Optional[CrossEncoderReranker] = None
@@ -106,26 +104,11 @@ class RAGSystem:
         else:
             self.llm_client = OllamaLLMClient(llm_config)
         
-        # FAISS 및 BM25 인덱스 자동 로드 (VectorStoreManager에서 이미 시도했지만, 상태 확인 및 로깅)
-        if hasattr(self.vector_store_manager, 'langchain_retrieval_manager') and \
-           self.vector_store_manager.langchain_retrieval_manager:
-            langchain_manager = self.vector_store_manager.langchain_retrieval_manager
-            
-            # 인덱스 상태 검증
-            qdrant_stats = self.vector_store_manager.get_stats()
-            qdrant_doc_count = qdrant_stats.get('points_count', None)
-            
-            validation_result = langchain_manager.validate_indexes(qdrant_doc_count)
-            
-            if validation_result['warnings']:
-                for warning in validation_result['warnings']:
-                    self.logger.warning(warning)
-                self.logger.info("인덱스 재구축을 권장합니다. /rebuild-indexes API를 사용하세요.")
-            else:
-                if validation_result['faiss_available']:
-                    self.logger.info(f"FAISS 인덱스 준비 완료 (문서 {validation_result['faiss_document_count']}개)")
-                if validation_result['bm25_available']:
-                    self.logger.info(f"BM25 인덱스 준비 완료 (문서 {validation_result['bm25_document_count']}개)")
+        # Qdrant 벡터 저장소 상태 확인
+        qdrant_stats = self.vector_store.get_collection_info()
+        if qdrant_stats:
+            points_count = qdrant_stats.get('points_count', 0)
+            self.logger.info(f"Qdrant 컬렉션 준비 완료 (포인트 {points_count}개)")
         
         self.logger.info("RAG 시스템이 초기화되었습니다")
     
@@ -136,14 +119,14 @@ class RAGSystem:
         
         self.logger.info("GPU 메모리 해제 시작...")
         
-        # 임베딩 모델 해제
-        if hasattr(self, 'embedding_manager') and self.embedding_manager:
-            if hasattr(self.embedding_manager, 'client') and hasattr(self.embedding_manager.client, 'model'):
+        # BGE-m3 모델 해제
+        if hasattr(self, 'vector_store') and self.vector_store:
+            if hasattr(self.vector_store, 'bge_model') and self.vector_store.bge_model:
                 try:
-                    del self.embedding_manager.client.model
-                    self.logger.info("임베딩 모델 메모리 해제 완료")
+                    del self.vector_store.bge_model
+                    self.logger.info("BGE-m3 모델 메모리 해제 완료")
                 except Exception as e:
-                    self.logger.warning(f"임베딩 모델 메모리 해제 실패: {str(e)}")
+                    self.logger.warning(f"BGE-m3 모델 메모리 해제 실패: {str(e)}")
         
         # 리랭커 모델 해제
         if self.reranker and hasattr(self.reranker, 'model'):
@@ -164,35 +147,50 @@ class RAGSystem:
         self.logger.info("GPU 메모리 해제 완료")
     
     def reload_embedding_model(self, config: Optional[Dict[str, Any]] = None):
-        """임베딩 모델 동적 재로드"""
-        self.logger.info("임베딩 모델 재로드 시작...")
+        """BGE-m3 모델 동적 재로드"""
+        self.logger.info("BGE-m3 모델 재로드 시작...")
         
         # 기존 모델 해제
-        if hasattr(self, 'embedding_manager') and self.embedding_manager:
-            if hasattr(self.embedding_manager, 'client') and hasattr(self.embedding_manager.client, 'model'):
-                del self.embedding_manager.client.model
+        if hasattr(self, 'vector_store') and self.vector_store:
+            if hasattr(self.vector_store, 'bge_model') and self.vector_store.bge_model:
+                del self.vector_store.bge_model
                 import torch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         
         # 새 모델 로드
         try:
+            from FlagEmbedding import BGEM3FlagModel
+            from src.utils.config import get_embedding_config
+            
             if config is None:
-                from src.utils.config import get_embedding_config
-                config = get_embedding_config()
+                embedding_config = get_embedding_config()
+            else:
+                embedding_config = config
             
-            self.embedding_manager = EmbeddingManager(config)
+            model_path = embedding_config.model_path or embedding_config.name
+            if not model_path:
+                raise ValueError("BGE-m3 모델 경로가 설정되지 않았습니다.")
             
-            # VectorStoreManager도 업데이트
-            self.vector_store_manager.embedding_manager = self.embedding_manager
-            from src.modules.langchain_embedding_wrapper import EmbeddingManagerWrapper
-            langchain_embeddings = EmbeddingManagerWrapper(self.embedding_manager)
-            self.vector_store_manager.store.embeddings = langchain_embeddings
+            # GPU 사용 가능 여부 확인
+            use_fp16 = True
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    use_fp16 = False
+            except ImportError:
+                use_fp16 = False
             
-            self.logger.info("임베딩 모델 재로드 완료")
+            # 새 BGE-m3 모델 로드
+            new_bge_model = BGEM3FlagModel(model_path, use_fp16=use_fp16)
+            
+            # QdrantVectorStore의 BGE-m3 모델 업데이트
+            self.vector_store.bge_model = new_bge_model
+            
+            self.logger.info("BGE-m3 모델 재로드 완료")
             return True
         except Exception as e:
-            self.logger.error(f"임베딩 모델 재로드 실패: {str(e)}")
+            self.logger.error(f"BGE-m3 모델 재로드 실패: {str(e)}")
             return False
     
     def reload_reranker(self, config: Optional[Dict[str, Any]] = None):
@@ -243,7 +241,7 @@ class RAGSystem:
     
     def delete_document(self, source_file: str) -> Dict[str, Any]:
         """
-        특정 문서를 모든 저장소에서 삭제
+        특정 문서를 Qdrant에서 삭제 (FAISS/BM25 제거됨)
         
         Args:
             source_file: 삭제할 문서의 소스 파일 경로
@@ -254,37 +252,34 @@ class RAGSystem:
         try:
             self.logger.info(f"문서 삭제 시작: {source_file}")
             
-            # VectorStoreManager를 통해 삭제 (Qdrant + BM25 + FAISS 처리)
-            result = self.vector_store_manager.delete_document(source_file)
+            # Qdrant에서 삭제 (삭제된 청크 수 반환)
+            qdrant_success, deleted_chunks_count = self.vector_store._delete_document_vectors(source_file)
             
-            # 임베딩 캐시는 메모리 기반이므로 서버 재시작 시 자동 초기화됨
-            # 특정 문서의 캐시만 삭제하는 것은 복잡하므로 선택적 기능으로 제외
-            
-            qdrant_success = result.get('qdrant_success', result.get('qdrant_deleted', False))
             if qdrant_success:
-                deleted_count = result.get('deleted_chunks_count', 0)
-                self.logger.info(
-                    f"문서 삭제 완료: {source_file} "
-                    f"(청크 {deleted_count}개 삭제)"
-                )
+                self.logger.info(f"문서 삭제 완료: {source_file}, {deleted_chunks_count}개 청크 삭제됨")
             else:
                 self.logger.error(f"문서 삭제 실패: {source_file}")
             
-            return result
+            return {
+                'success': qdrant_success,
+                'qdrant_success': qdrant_success,
+                'qdrant_deleted': qdrant_success,
+                'deleted_chunks_count': deleted_chunks_count
+            }
             
         except Exception as e:
             self.logger.error(f"문서 삭제 중 예외 발생: {source_file}, 오류: {str(e)}")
             import traceback
             self.logger.error(f"상세 오류: {traceback.format_exc()}")
             return {
+                'success': False,
                 'qdrant_success': False,
-                'bm25_success': False,
-                'faiss_handled': False,
+                'qdrant_deleted': False,
                 'deleted_chunks_count': 0,
                 'warnings': [f"삭제 중 예외 발생: {str(e)}"]
             }
     
-    def process_and_store_documents(self, input_dir: str, force_update: bool = False, replace_mode: bool = False, build_bm25_index: bool = True) -> bool:
+    def process_and_store_documents(self, input_dir: str, force_update: bool = False, replace_mode: bool = False) -> bool:
         """문서 처리 및 저장"""
         try:
             self.logger.info(f"문서 처리 시작: {input_dir}")
@@ -303,53 +298,14 @@ class RAGSystem:
                 # 교체 모드: 파일별로 완전 교체
                 success = self._process_chunks_in_replace_mode(chunks)
             else:
-                # 일반 모드: 기존 방식 (Qdrant + FAISS)
-                # Qdrant에 저장 시 sparse_enabled이면 자동으로 dense+sparse 벡터 함께 저장
-                success = self.vector_store_manager.add_chunks(chunks, force_update)
+                # 일반 모드: Qdrant에 저장 (sparse_enabled이면 자동으로 dense+sparse 벡터 함께 저장)
+                success = self.vector_store.add_documents(chunks, force_update)
             
             if not success:
                 self.logger.error("벡터 저장소 저장 실패")
                 return False
             
-            # FAISS 인덱스가 없으면 생성
-            if hasattr(self.vector_store_manager, 'langchain_retrieval_manager') and \
-               self.vector_store_manager.langchain_retrieval_manager:
-                if self.vector_store_manager.langchain_retrieval_manager.faiss_store is None:
-                    self.logger.info("FAISS 인덱스 생성 중...")
-                    faiss_success = self.vector_store_manager.langchain_retrieval_manager.initialize_faiss_from_chunks(chunks)
-                    if faiss_success:
-                        self.logger.info("FAISS 인덱스 생성 완료")
-                    else:
-                        self.logger.warning("FAISS 인덱스 생성 실패 (Qdrant는 정상 동작)")
-            
-            # 3. BM25 인덱스 구축 (LangChain BM25Retriever 또는 레거시)
-            if build_bm25_index:
-                self.logger.info("BM25 인덱스 구축 시작...")
-                bm25_success = self.vector_store_manager.build_bm25_index(chunks)
-                if bm25_success:
-                    self.logger.info("BM25 인덱스 구축 완료")
-                else:
-                    self.logger.warning("BM25 인덱스 구축 실패 (검색은 계속 진행됩니다)")
-                
-                # LangChain EnsembleRetriever 초기화 시도
-                if hasattr(self.vector_store_manager, 'langchain_retrieval_manager') and \
-                   self.vector_store_manager.langchain_retrieval_manager:
-                    try:
-                        from src.utils.config import get_qdrant_config
-                        qdrant_config = get_qdrant_config()
-                        faiss_weight = qdrant_config.hybrid_search_vector_weight if hasattr(qdrant_config, 'hybrid_search_vector_weight') else 0.7
-                        bm25_weight = qdrant_config.hybrid_search_bm25_weight if hasattr(qdrant_config, 'hybrid_search_bm25_weight') else 0.3
-                        rrf_c = qdrant_config.hybrid_search_rrf_k if hasattr(qdrant_config, 'hybrid_search_rrf_k') else 60
-                        
-                        self.vector_store_manager.langchain_retrieval_manager.create_ensemble_retriever(
-                            faiss_weight=faiss_weight,
-                            bm25_weight=bm25_weight,
-                            c=rrf_c,
-                            k=self.rag_config.default_max_sources
-                        )
-                        self.logger.info("EnsembleRetriever 초기화 완료")
-                    except Exception as e:
-                        self.logger.warning(f"EnsembleRetriever 초기화 실패: {str(e)}")
+            # FAISS/BM25 인덱스는 더 이상 사용하지 않음 (Qdrant Dense+Sparse만 사용)
             
             self.logger.info("문서 처리 및 저장 완료")
             return True
@@ -358,7 +314,7 @@ class RAGSystem:
             self.logger.error(f"문서 처리 및 저장 실패: {str(e)}")
             return False
     
-    async def process_and_store_documents_async(self, input_dir: str, force_update: bool = False, replace_mode: bool = False, build_bm25_index: bool = True) -> bool:
+    async def process_and_store_documents_async(self, input_dir: str, force_update: bool = False, replace_mode: bool = False) -> bool:
         """문서 처리 및 저장 (비동기)"""
         import asyncio
         
@@ -385,9 +341,9 @@ class RAGSystem:
                     chunks
                 )
             else:
-                # 일반 모드: 기존 방식 (Qdrant + FAISS)
+                # 일반 모드: Qdrant에 저장 (sparse_enabled이면 자동으로 dense+sparse 벡터 함께 저장)
                 success = await asyncio.to_thread(
-                    self.vector_store_manager.add_chunks,
+                    self.vector_store.add_documents,
                     chunks,
                     force_update
                 )
@@ -396,53 +352,7 @@ class RAGSystem:
                 self.logger.error("벡터 저장소 저장 실패")
                 return False
             
-            # FAISS 인덱스가 없으면 생성 (I/O 작업 - 비동기화)
-            if hasattr(self.vector_store_manager, 'langchain_retrieval_manager') and \
-               self.vector_store_manager.langchain_retrieval_manager:
-                langchain_manager = self.vector_store_manager.langchain_retrieval_manager
-                if langchain_manager.faiss_store is None:
-                    self.logger.info("FAISS 인덱스 생성 중...")
-                    faiss_success = await asyncio.to_thread(
-                        langchain_manager.initialize_faiss_from_chunks,
-                        chunks
-                    )
-                    if faiss_success:
-                        self.logger.info("FAISS 인덱스 생성 완료")
-                    else:
-                        self.logger.warning("FAISS 인덱스 생성 실패 (Qdrant는 정상 동작)")
-            
-            # 3. BM25 인덱스 구축 (I/O 작업 - 비동기화)
-            if build_bm25_index:
-                self.logger.info("BM25 인덱스 구축 시작...")
-                bm25_success = await asyncio.to_thread(
-                    self.vector_store_manager.build_bm25_index,
-                    chunks
-                )
-                if bm25_success:
-                    self.logger.info("BM25 인덱스 구축 완료")
-                else:
-                    self.logger.warning("BM25 인덱스 구축 실패 (검색은 계속 진행됩니다)")
-                
-                # LangChain EnsembleRetriever 초기화 시도
-                if hasattr(self.vector_store_manager, 'langchain_retrieval_manager') and \
-                   self.vector_store_manager.langchain_retrieval_manager:
-                    try:
-                        from src.utils.config import get_qdrant_config
-                        qdrant_config = get_qdrant_config()
-                        faiss_weight = qdrant_config.hybrid_search_vector_weight if hasattr(qdrant_config, 'hybrid_search_vector_weight') else 0.7
-                        bm25_weight = qdrant_config.hybrid_search_bm25_weight if hasattr(qdrant_config, 'hybrid_search_bm25_weight') else 0.3
-                        rrf_c = qdrant_config.hybrid_search_rrf_k if hasattr(qdrant_config, 'hybrid_search_rrf_k') else 60
-                        
-                        await asyncio.to_thread(
-                            self.vector_store_manager.langchain_retrieval_manager.create_ensemble_retriever,
-                            faiss_weight=faiss_weight,
-                            bm25_weight=bm25_weight,
-                            c=rrf_c,
-                            k=self.rag_config.default_max_sources
-                        )
-                        self.logger.info("EnsembleRetriever 초기화 완료")
-                    except Exception as e:
-                        self.logger.warning(f"EnsembleRetriever 초기화 실패: {str(e)}")
+            # FAISS/BM25 인덱스는 더 이상 사용하지 않음 (Qdrant Dense+Sparse만 사용)
             
             self.logger.info("비동기 문서 처리 및 저장 완료")
             return True
@@ -479,7 +389,7 @@ class RAGSystem:
                 )
                 
                 file_start_time = time.time()
-                success = self.vector_store_manager.replace_document_vectors(file_path, file_chunk_list)
+                success = self.vector_store.replace_document_vectors(file_path, file_chunk_list)
                 file_time = time.time() - file_start_time
                 
                 if success:
@@ -505,25 +415,31 @@ class RAGSystem:
             self.logger.error(f"상세 오류: {traceback.format_exc()}")
             return False
     
-    async def query(self, question: str, max_sources: Optional[int] = None, score_threshold: Optional[float] = None, model_name: Optional[str] = None, retrievers: Optional[Dict[str, bool]] = None) -> RAGResponse:
-        """
-        질의응답 (비동기 - query_async() 호출)
-        
-        .. deprecated:: 1.0.0
-            이 메서드는 query_async()의 래퍼입니다. 
-            새로운 코드에서는 query_async()를 직접 사용하세요.
-        """
-        # 레거시 호환성을 위해 query_async()를 호출
-        return await self.query_async(question, max_sources, score_threshold, model_name, retrievers)
-    
     # ========== 비동기 메서드 (Phase 1: LLM 호출 비동기화) ==========
     
-    async def query_async(self, question: str, max_sources: Optional[int] = None, score_threshold: Optional[float] = None, model_name: Optional[str] = None, retrievers: Optional[Dict[str, bool]] = None) -> RAGResponse:
-        """비동기 질의응답 (LLM 호출, 검색, 리랭킹 모두 비동기 - Phase 3 완료)"""
+    async def query_async(self, question: str, max_sources: Optional[int] = None, score_threshold: Optional[float] = None, model_name: Optional[str] = None, retrievers: Optional[Dict[str, bool]] = None, session_id: Optional[str] = None, dense_weight: Optional[float] = None, sparse_weight: Optional[float] = None) -> RAGResponse:
+        """
+        비동기 질의응답 (LLM 호출, 검색, 리랭킹 모두 비동기 - Phase 3 완료)
+        
+        Args:
+            question: 사용자 질문
+            max_sources: 최대 소스 수
+            score_threshold: 점수 임계값
+            model_name: 사용할 LLM 모델명
+            retrievers: 검색기 선택 정보
+            session_id: 세션 ID (선택적, 기본 RAG에서는 사용하지 않지만 API 호환성을 위해 수락)
+        """
         start_time = time.time()
+        
+        # session_id는 기본 RAG 시스템에서 사용하지 않지만, API 호환성을 위해 수락
+        if session_id:
+            self.logger.debug(f"세션 ID 수신: {session_id} (기본 RAG에서는 사용하지 않음)")
         
         try:
             self.logger.info(f"비동기 질의 처리 시작: {question[:50]}...")
+            
+            # 검색에 사용할 질문 (원본 그대로 사용)
+            search_question = question
             
             # 기본값 적용
             max_sources = max_sources if max_sources is not None else self.rag_config.default_max_sources
@@ -531,7 +447,7 @@ class RAGSystem:
             
             # 동적 임계값 조정
             score_threshold = self._calculate_dynamic_threshold(
-                question=question,
+                question=search_question,
                 base_threshold=base_threshold,
                 max_sources=max_sources
             )
@@ -552,13 +468,13 @@ class RAGSystem:
                 self.llm_client = OllamaLLMClient(model_config)
             
             # 일반적인 질문인지 확인
-            is_general = is_general_question(question)
-            self.logger.debug(f"질문 '{question}' 일반 질문 판별 결과: {is_general}")
+            is_general = is_general_question(search_question)
+            self.logger.debug(f"질문 '{search_question}' 일반 질문 판별 결과: {is_general}")
             
             if is_general:
                 # 일반 질문은 벡터 검색 없이 바로 LLM에 질문 (비동기)
-                self.logger.info(f"일반 질문으로 판단: 벡터 검색 건너뛰기 (질문: '{question}')")
-                llm_response = await self.llm_client.generate_answer_async(question, context="")
+                self.logger.info(f"일반 질문으로 판단: 벡터 검색 건너뛰기 (질문: '{search_question}')")
+                llm_response = await self.llm_client.generate_answer_async(search_question, context="")
                 answer = llm_response.text if llm_response else "답변을 생성할 수 없습니다."
                 is_general_flag = llm_response.is_general if llm_response else True
                 
@@ -574,17 +490,14 @@ class RAGSystem:
                 )
             
             # 전문 질문이므로 검색 수행 (비동기 - Phase 2)
-            self.logger.info(f"전문 질문으로 판단: 검색 수행 (질문: '{question}')")
+            self.logger.info(f"전문 질문으로 판단: 검색 수행 (질문: '{search_question}')")
             
             # 검색기 선택이 제공된 경우
             if retrievers is not None:
                 self.logger.info(f"검색기 선택 사용: {retrievers}")
                 
-                selected_count = sum([
-                    retrievers.get('use_qdrant', False),
-                    retrievers.get('use_faiss', False),
-                    retrievers.get('use_bm25', False)
-                ])
+                # Qdrant만 사용 (FAISS/BM25 제거됨)
+                selected_count = 1 if retrievers.get('use_qdrant', False) else 0
                 
                 search_limit = max_sources if selected_count == 1 else max_sources * 2
                 self.logger.debug(f"검색기 개수: {selected_count}, 검색 제한: {search_limit}")
@@ -594,16 +507,33 @@ class RAGSystem:
                 # Qdrant 검색 (비동기)
                 if retrievers.get('use_qdrant', False):
                     try:
-                        # Dense/Sparse 가중치 추출
-                        dense_weight = retrievers.get('dense_weight')
-                        sparse_weight = retrievers.get('sparse_weight')
+                        # Dense/Sparse 가중치 추출 (retrievers > 파라미터 > config 기본값)
+                        from src.utils.config import get_qdrant_config
+                        qdrant_config = get_qdrant_config()
+                        config_dense_weight = getattr(qdrant_config, 'hybrid_search_dense_weight', 0.7)
+                        config_sparse_weight = getattr(qdrant_config, 'hybrid_search_sparse_weight', 0.3)
                         
-                        qdrant_results = await self.vector_store_manager.store.search_similar_async(
-                            query=question,
+                        # 우선순위: retrievers > 파라미터 > config 기본값
+                        effective_dense_weight = retrievers.get('dense_weight')
+                        if effective_dense_weight is None:
+                            effective_dense_weight = dense_weight
+                        if effective_dense_weight is None:
+                            effective_dense_weight = config_dense_weight
+                        
+                        effective_sparse_weight = retrievers.get('sparse_weight')
+                        if effective_sparse_weight is None:
+                            effective_sparse_weight = sparse_weight
+                        if effective_sparse_weight is None:
+                            effective_sparse_weight = config_sparse_weight
+                        
+                        self.logger.debug(f"Qdrant 검색 가중치: dense={effective_dense_weight:.2f}, sparse={effective_sparse_weight:.2f}")
+                        
+                        qdrant_results = await self.vector_store.search_similar_async(
+                            query=search_question,
                             limit=search_limit,
                             score_threshold=score_threshold,
-                            dense_weight=dense_weight,
-                            sparse_weight=sparse_weight
+                            dense_weight=effective_dense_weight,
+                            sparse_weight=effective_sparse_weight
                         )
                         if qdrant_results:
                             all_results.append(('qdrant', qdrant_results))
@@ -611,47 +541,7 @@ class RAGSystem:
                     except Exception as e:
                         self.logger.warning(f"Qdrant 검색 실패: {str(e)}")
                 
-                # FAISS 검색 (비동기)
-                if retrievers.get('use_faiss', False):
-                    try:
-                        langchain_manager = self.vector_store_manager.langchain_retrieval_manager
-                        if langchain_manager is None:
-                            self.logger.warning("LangChain Retrieval Manager가 초기화되지 않았습니다.")
-                        elif langchain_manager.faiss_store is None:
-                            self.logger.warning("FAISS 인덱스가 초기화되지 않았습니다.")
-                        else:
-                            import asyncio
-                            faiss_results = await asyncio.to_thread(
-                                langchain_manager.search_with_faiss_only,
-                                query=question,
-                                k=search_limit,
-                                score_threshold=score_threshold
-                            )
-                            if faiss_results:
-                                all_results.append(('faiss', faiss_results))
-                                self.logger.info(f"FAISS 검색 성공: {len(faiss_results)}개 결과")
-                    except Exception as e:
-                        self.logger.error(f"FAISS 검색 실패: {str(e)}", exc_info=True)
-                
-                # BM25 검색 (비동기)
-                if retrievers.get('use_bm25', False):
-                    try:
-                        langchain_manager = self.vector_store_manager.langchain_retrieval_manager
-                        if langchain_manager and langchain_manager.bm25_retriever:
-                            import asyncio
-                            bm25_results = await asyncio.to_thread(
-                                langchain_manager.search_with_bm25_only,
-                                query=question,
-                                k=search_limit,
-                                score_threshold=score_threshold
-                            )
-                            if bm25_results:
-                                all_results.append(('bm25', bm25_results))
-                                self.logger.debug(f"BM25 검색 결과: {len(bm25_results)}개")
-                        else:
-                            self.logger.warning("BM25 인덱스가 초기화되지 않았습니다.")
-                    except Exception as e:
-                        self.logger.warning(f"BM25 검색 실패: {str(e)}")
+                # FAISS/BM25 검색은 더 이상 사용하지 않음 (Qdrant Dense+Sparse만 사용)
                 
                 if not all_results:
                     self.logger.warning("선택된 검색기에서 결과를 찾을 수 없습니다.")
@@ -665,12 +555,10 @@ class RAGSystem:
                         similar_docs.append(item)
                     self.logger.info(f"단일 검색기 사용: {all_results[0][0]}, 결과 {len(similar_docs)}개")
                 else:
-                    # 다중 검색기: RRF 통합 (동기 로직 재사용)
-                    weights = retrievers.get('weights') or {'qdrant': 1.0, 'faiss': 0.0, 'bm25': 0.0}
+                    # 다중 검색기: RRF 통합 (Qdrant만 사용하므로 단일 검색기와 동일)
+                    weights = retrievers.get('weights') or {'qdrant': 1.0}
                     name_to_weight = {
-                        'qdrant': float(weights.get('qdrant', 0.0)),
-                        'faiss': float(weights.get('faiss', 0.0)),
-                        'bm25': float(weights.get('bm25', 0.0)),
+                        'qdrant': float(weights.get('qdrant', 1.0)),
                     }
                     results_list = [results for _, results in all_results]
                     retriever_names = [name for name, _ in all_results]
@@ -742,30 +630,34 @@ class RAGSystem:
                     except Exception as e:
                         self.logger.warning(f"리랭킹 적용 실패: {str(e)}")
             else:
-                # 기존 로직 (하이브리드 검색 또는 벡터 검색만) - 동기
+                # retrievers가 None일 때: 기본 Qdrant 검색 사용 (dense/sparse 가중치 지원)
                 from src.utils.config import get_qdrant_config
                 qdrant_config = get_qdrant_config()
-                hybrid_enabled = qdrant_config.hybrid_search_enabled
-                langchain_available = (
-                    hasattr(self.vector_store_manager, 'langchain_retrieval_manager') and
-                    self.vector_store_manager.langchain_retrieval_manager is not None and
-                    self.vector_store_manager.langchain_retrieval_manager.faiss_store is not None and
-                    self.vector_store_manager.langchain_retrieval_manager.bm25_retriever is not None
-                )
                 
-                if hybrid_enabled and langchain_available:
-                    self.logger.info("EnsembleRetriever 검색 사용 (FAISS + BM25) - 비동기")
-                    similar_docs = await self.vector_store_manager.hybrid_search_async(
-                        query=question,
-                        limit=max_sources,
-                        score_threshold=score_threshold
-                    )
-                else:
-                    similar_docs = await self.vector_store_manager.search_similar_async(
-                        query=question,
-                        limit=max_sources,
-                        score_threshold=score_threshold
-                    )
+                # Dense/Sparse 가중치 결정 (파라미터 > retrievers > config 기본값)
+                effective_dense_weight = dense_weight
+                effective_sparse_weight = sparse_weight
+                
+                if effective_dense_weight is None or effective_sparse_weight is None:
+                    # config에서 기본값 가져오기
+                    config_dense_weight = getattr(qdrant_config, 'hybrid_search_dense_weight', 0.7)
+                    config_sparse_weight = getattr(qdrant_config, 'hybrid_search_sparse_weight', 0.3)
+                    
+                    if effective_dense_weight is None:
+                        effective_dense_weight = config_dense_weight
+                    if effective_sparse_weight is None:
+                        effective_sparse_weight = config_sparse_weight
+                
+                self.logger.info(f"기본 Qdrant 검색 사용: dense_weight={effective_dense_weight:.2f}, sparse_weight={effective_sparse_weight:.2f}")
+                
+                # Qdrant 검색 (dense/sparse 가중치 전달)
+                similar_docs = await self.vector_store.search_similar_async(
+                    query=search_question,
+                    limit=max_sources,
+                    score_threshold=score_threshold,
+                    dense_weight=effective_dense_weight,
+                    sparse_weight=effective_sparse_weight
+                )
                 
                 # 설정 기반 리랭킹 (비동기 - Phase 3)
                 if similar_docs and self.reranker:
@@ -839,6 +731,14 @@ class RAGSystem:
                     is_rag_answer=False
                 )
             
+            # 검색 결과 로깅
+            self.logger.info(f"🔍 검색 결과 처리 시작: 총 {len(similar_docs)}개 문서 검색됨")
+            for idx, doc in enumerate(similar_docs, 1):
+                source_file = doc.get('source_file', 'N/A')
+                chunk_index = doc.get('chunk_index', 'N/A')
+                score = doc.get('score', 0.0)
+                self.logger.info(f"  [{idx}] 파일: {source_file}, 청크: {chunk_index}, 점수: {score:.4f}")
+            
             # 중복 청크 제거
             unique_docs = []
             seen_chunks = set()
@@ -847,6 +747,9 @@ class RAGSystem:
                 if chunk_key not in seen_chunks:
                     seen_chunks.add(chunk_key)
                     unique_docs.append(doc)
+            removed_duplicates = len(similar_docs) - len(unique_docs)
+            if removed_duplicates > 0:
+                self.logger.info(f"🔄 중복 청크 제거: {removed_duplicates}개 제거됨 (남은 문서: {len(unique_docs)}개)")
             similar_docs = unique_docs
             
             # 표 데이터 중복 제거
@@ -854,9 +757,13 @@ class RAGSystem:
                 table_docs = [doc for doc in similar_docs if '표 데이터' in doc.get('content', '')]
                 if len(table_docs) > 1:
                     table_docs.sort(key=lambda x: x.get('score', 0), reverse=True)
+                    removed_table_duplicates = 0
                     for table_doc in table_docs[1:]:
                         if table_doc in similar_docs:
                             similar_docs.remove(table_doc)
+                            removed_table_duplicates += 1
+                    if removed_table_duplicates > 0:
+                        self.logger.info(f"🔄 표 데이터 중복 제거: {removed_table_duplicates}개 제거됨 (남은 문서: {len(similar_docs)}개)")
             
             if not similar_docs:
                 return RAGResponse(
@@ -871,8 +778,8 @@ class RAGSystem:
             # 컨텍스트 구성 (토큰 제한 자동 조정)
             context = self._build_context(similar_docs, max_tokens=None)
             
-            # LLM을 통한 답변 생성 (비동기)
-            llm_response = await self.llm_client.generate_answer_async(question, context)
+            # LLM을 통한 답변 생성 (비동기) - 정제된 질문 사용
+            llm_response = await self.llm_client.generate_answer_async(search_question, context)
             answer = llm_response.text if llm_response else "답변을 생성할 수 없습니다."
             is_general = llm_response.is_general if llm_response else False
             has_rag_context = llm_response.has_rag_context if llm_response else True
@@ -882,6 +789,12 @@ class RAGSystem:
             
             # 소스 정보 정리
             sources = self._format_sources(similar_docs)
+            self.logger.info(f"📚 최종 참조 문서: {len(sources)}개")
+            for idx, source in enumerate(sources, 1):
+                source_file = source.get('source_file', 'N/A')
+                chunk_index = source.get('chunk_index', 'N/A')
+                relevance_score = source.get('relevance_score', 0.0)
+                self.logger.info(f"  [{idx}] 파일: {source_file}, 청크: {chunk_index}, 관련도: {relevance_score:.4f}")
             
             processing_time = time.time() - start_time
             
@@ -914,6 +827,7 @@ class RAGSystem:
         동적 임계값 계산
         
         질문 유형과 요청된 문서 수에 따라 임계값을 조정합니다.
+        기본 임계값이 낮아졌으므로 조정 폭을 줄여 더 관대하게 처리합니다.
         
         Args:
             question: 사용자 질문
@@ -925,22 +839,22 @@ class RAGSystem:
         """
         threshold = base_threshold
         
-        # 1. 질문 길이에 따른 조정 (짧은 질문은 더 엄격하게)
+        # 1. 질문 길이에 따른 조정 (더 관대하게)
         question_length = len(question.strip())
         if question_length < 10:
-            # 매우 짧은 질문: 임계값 증가 (더 관련성 높은 결과만)
-            threshold += 0.1
+            # 매우 짧은 질문: 임계값 약간 증가
+            threshold += 0.05
         elif question_length > 50:
             # 긴 질문: 임계값 감소 (더 많은 결과 포함)
             threshold -= 0.05
         
-        # 2. 요청된 문서 수에 따른 조정
+        # 2. 요청된 문서 수에 따른 조정 (더 관대하게)
         if max_sources <= 3:
-            # 적은 수의 문서 요청: 임계값 증가 (고품질만)
-            threshold += 0.1
+            # 적은 수의 문서 요청: 임계값 약간 증가
+            threshold += 0.05
         elif max_sources >= 10:
             # 많은 수의 문서 요청: 임계값 감소 (더 넓은 범위)
-            threshold -= 0.1
+            threshold -= 0.05
         
         # 3. 질문 유형에 따른 조정
         question_lower = question.lower()
@@ -948,20 +862,21 @@ class RAGSystem:
         # 키워드 기반 질문 (예: "변압기 진단 기준")
         if any(keyword in question_lower for keyword in ['기준', '방법', '절차', '과정', '원리']):
             # 구체적인 정보 요청: 임계값 약간 감소
-            threshold -= 0.05
+            threshold -= 0.03
         
         # 비교/분석 질문 (예: "차이점", "비교")
         if any(keyword in question_lower for keyword in ['차이', '비교', '분석', '대비']):
             # 여러 문서 비교 필요: 임계값 감소
-            threshold -= 0.1
+            threshold -= 0.05
         
         # 표/데이터 질문
         if any(keyword in question_lower for keyword in ['표', 'table', '데이터', '수치']):
-            # 표 데이터는 정확한 매칭 필요: 임계값 유지 또는 약간 증가
-            threshold += 0.05
+            # 표 데이터는 정확한 매칭 필요: 임계값 약간 증가
+            threshold += 0.03
         
         # 임계값 범위 제한 (0.0 ~ 1.0)
-        threshold = max(0.0, min(1.0, threshold))
+        # 최소 임계값을 0.2로 설정하여 너무 낮은 점수는 제외
+        threshold = max(0.2, min(1.0, threshold))
         
         return threshold
     
@@ -1063,6 +978,39 @@ class RAGSystem:
         sources = []
         preview_length = self.rag_config.content_preview_length
         
+        # 점수 정규화를 위한 최대/최소 점수 계산
+        if similar_docs:
+            scores = [doc.get('score', 0.0) for doc in similar_docs]
+            if not scores:
+                max_score = 1.0
+                min_score = 0.0
+                score_range = 1.0
+            else:
+                max_score = max(scores)
+                min_score = min(scores)
+                score_range = max_score - min_score if max_score > min_score else 1.0
+                
+                # 모든 점수가 같을 때 처리 (정규화 불가능)
+                if score_range == 0.0:
+                    # 모든 점수가 같으면 원본 점수를 그대로 사용 (정규화 없음)
+                    self.logger.warning(
+                        f"모든 점수가 동일함 ({max_score:.4f}). "
+                        f"정규화 없이 원본 점수를 그대로 사용합니다. "
+                        f"문서 수: {len(similar_docs)}개"
+                    )
+                    score_range = 1.0  # 나눗셈 오류 방지
+                else:
+                    # 정규화 가능한 경우 점수 범위 로그
+                    self.logger.debug(
+                        f"점수 정규화: 범위={min_score:.4f}~{max_score:.4f}, "
+                        f"문서 수={len(similar_docs)}개"
+                    )
+        else:
+            max_score = 1.0
+            min_score = 0.0
+            score_range = 1.0
+            self.logger.warning("정규화할 문서가 없습니다. 기본값 사용")
+        
         for doc in similar_docs:
             content = doc['content']
             preview = content[:preview_length] + "..." if len(content) > preview_length else content
@@ -1101,11 +1049,55 @@ class RAGSystem:
             # 출처 경로 생성 ("> "로 구분)
             source_path = " > ".join(source_parts) if source_parts else filename
             
+            # 점수 정규화 (0-1 범위로)
+            raw_score = doc.get('score', 0.0)
+            
+            # 원본 점수 검증
+            if raw_score < 0.0 or raw_score > 1.0:
+                self.logger.warning(
+                    f"원본 점수가 0-1 범위를 벗어남: {raw_score:.4f}. "
+                    f"자동 클리핑 적용"
+                )
+                raw_score = max(0.0, min(1.0, raw_score))
+            
+            # 모든 점수가 같을 때는 원본 점수를 그대로 사용
+            if max_score == min_score:
+                # 모든 점수가 같으면 원본 점수를 그대로 사용 (정규화 없음)
+                normalized_score = raw_score
+            else:
+                # 개선된 정규화: 최소값을 0으로 만들지 않고, 최대값 기준으로 상대적 점수 계산
+                # 이렇게 하면 최소값 문서도 0이 아닌 값을 가짐
+                # 방법: score / max (최대값 기준 정규화)
+                # 예: 점수 0.6491 / 최대값 0.7318 = 0.887 (0이 아닌 값)
+                if max_score > 0:
+                    # 최대값 기준 정규화 (원본 점수의 상대적 비율 유지)
+                    # 모든 문서가 최대값 대비 상대적 점수를 가지므로, 최소값도 0이 아님
+                    normalized_score = raw_score / max_score
+                    self.logger.debug(
+                        f"최대값 기준 정규화: {raw_score:.4f} / {max_score:.4f} = {normalized_score:.4f}"
+                    )
+                else:
+                    # max_score가 0이면 원본 점수 사용
+                    self.logger.warning(f"max_score가 0입니다. 원본 점수 사용: {raw_score:.4f}")
+                    normalized_score = raw_score
+            
+            # 0-1 범위로 클리핑
+            normalized_score = max(0.0, min(1.0, normalized_score))
+            
+            # 정규화 결과 검증
+            if normalized_score < 0.0 or normalized_score > 1.0:
+                self.logger.error(
+                    f"정규화 후 점수가 0-1 범위를 벗어남: {normalized_score:.4f}. "
+                    f"원본 점수: {raw_score:.4f}, 범위: {min_score:.4f}~{max_score:.4f}"
+                )
+                normalized_score = max(0.0, min(1.0, normalized_score))
+            
             source = {
                 'content': preview,
                 'source_file': doc['source_file'],
                 'source_path': source_path,  # 계층 형식 출처 경로 추가
-                'relevance_score': doc['score'],
+                'relevance_score': normalized_score,  # 정규화된 점수 (0-1 범위)
+                'raw_score': raw_score,  # 원본 점수도 보존 (디버깅용)
                 'chunk_index': doc['chunk_index'],
                 'metadata': metadata  # 메타데이터 전체도 포함
             }
@@ -1117,11 +1109,11 @@ class RAGSystem:
         """시스템 통계 반환"""
         try:
             # 벡터 저장소 통계
-            vector_stats = self.vector_store_manager.get_collection_info()
+            vector_stats = self.vector_store.get_collection_info()
             
             # 임베딩 캐시 통계
             embedding_stats = {
-                'cache_size': len(self.embedding_manager.cache) if hasattr(self.embedding_manager, 'cache') else 0,
+                'cache_size': 0,  # BGE-m3는 캐시를 사용하지 않음
                 'model_name': self.config.model.get('embedding', {}).name if 'embedding' in self.config.model else 'unknown',
                 'dimension': self.config.model.get('embedding', {}).dimension if 'embedding' in self.config.model else 1024
             }
@@ -1143,7 +1135,7 @@ class RAGSystem:
     def get_documents_info(self) -> List[Dict[str, Any]]:
         """저장된 문서들의 정보 반환"""
         try:
-            return self.vector_store_manager.get_documents_info()
+            return self.vector_store.get_documents_info()
         except Exception as e:
             self.logger.error(f"문서 정보 조회 실패: {str(e)}")
             return []
@@ -1151,275 +1143,30 @@ class RAGSystem:
     def get_document_chunks(self, document_id: str) -> List[Dict[str, Any]]:
         """특정 문서의 청크 정보 반환"""
         try:
-            return self.vector_store_manager.get_document_chunks(document_id)
+            return self.vector_store.get_document_chunks(document_id)
         except Exception as e:
             self.logger.error(f"문서 청크 조회 실패: {str(e)}")
             return []
     
-    def rebuild_faiss_and_bm25_indexes(self) -> bool:
-        """
-        Qdrant에서 모든 문서를 읽어서 FAISS 및 BM25 인덱스 재생성
-        (문서 재업로드 없이 인덱스만 재구축)
-        
-        Returns:
-            재구축 성공 여부
-        """
-        try:
-            self.logger.info("FAISS 및 BM25 인덱스 재구축 시작...")
-            
-            # 1. Qdrant에서 모든 문서 정보 가져오기
-            documents_info = self.vector_store_manager.get_documents_info()
-            if not documents_info:
-                self.logger.warning("Qdrant에 문서가 없습니다. 문서를 먼저 업로드해주세요.")
-                return False
-            
-            self.logger.info(f"총 {len(documents_info)}개 문서 발견")
-            
-            # 2. 모든 문서의 청크 가져오기
-            all_chunks_data = []
-            for doc_info in documents_info:
-                source_file = doc_info.get('source_file', '')
-                if source_file:
-                    chunks_data = self.vector_store_manager.get_document_chunks(source_file)
-                    all_chunks_data.extend(chunks_data)
-            
-            if not all_chunks_data:
-                self.logger.warning("청크 데이터를 가져올 수 없습니다.")
-                return False
-            
-            self.logger.info(f"총 {len(all_chunks_data)}개 청크 발견")
-            
-            # 3. 딕셔너리 형식을 DocumentChunk로 변환
-            from src.modules.document_processor import DocumentChunk
-            chunks = []
-            for chunk_data in all_chunks_data:
-                # content_full이 있으면 사용, 없으면 content_preview 사용
-                content = chunk_data.get('content_full', '')
-                if not content:
-                    content = chunk_data.get('content_preview', '')
-                
-                # metadata에서 source_file 추출 (여러 가능한 위치 확인)
-                metadata = chunk_data.get('metadata', {})
-                source_file = (
-                    metadata.get('source_file') or 
-                    metadata.get('file_path') or
-                    chunk_data.get('source_file', '')
-                )
-                
-                chunk = DocumentChunk(
-                    content=content,
-                    metadata=metadata,
-                    chunk_id=chunk_data.get('chunk_id', ''),
-                    source_file=source_file,
-                    chunk_index=chunk_data.get('chunk_index', 0)
-                )
-                chunks.append(chunk)
-            
-            # 4. FAISS 인덱스 생성
-            if hasattr(self.vector_store_manager, 'langchain_retrieval_manager') and \
-               self.vector_store_manager.langchain_retrieval_manager:
-                self.logger.info("FAISS 인덱스 생성 중...")
-                faiss_success = self.vector_store_manager.langchain_retrieval_manager.initialize_faiss_from_chunks(chunks)
-                if faiss_success:
-                    self.logger.info("FAISS 인덱스 생성 완료")
-                else:
-                    self.logger.error("FAISS 인덱스 생성 실패")
-                    return False
-            else:
-                self.logger.error("LangChain Retrieval Manager가 초기화되지 않았습니다.")
-                return False
-            
-            # 5. BM25 인덱스 구축
-            self.logger.info("BM25 인덱스 구축 중...")
-            bm25_success = self.vector_store_manager.build_bm25_index(chunks)
-            if bm25_success:
-                self.logger.info("BM25 인덱스 구축 완료")
-            else:
-                self.logger.error("BM25 인덱스 구축 실패")
-                return False
-            
-            # 6. EnsembleRetriever 초기화
-            if hasattr(self.vector_store_manager, 'langchain_retrieval_manager') and \
-               self.vector_store_manager.langchain_retrieval_manager:
-                try:
-                    from src.utils.config import get_qdrant_config
-                    qdrant_config = get_qdrant_config()
-                    faiss_weight = qdrant_config.hybrid_search_vector_weight if hasattr(qdrant_config, 'hybrid_search_vector_weight') else 0.7
-                    bm25_weight = qdrant_config.hybrid_search_bm25_weight if hasattr(qdrant_config, 'hybrid_search_bm25_weight') else 0.3
-                    rrf_c = qdrant_config.hybrid_search_rrf_k if hasattr(qdrant_config, 'hybrid_search_rrf_k') else 60
-                    
-                    self.vector_store_manager.langchain_retrieval_manager.create_ensemble_retriever(
-                        faiss_weight=faiss_weight,
-                        bm25_weight=bm25_weight,
-                        c=rrf_c,
-                        k=self.rag_config.default_max_sources
-                    )
-                    self.logger.info("EnsembleRetriever 초기화 완료")
-                except Exception as e:
-                    self.logger.warning(f"EnsembleRetriever 초기화 실패: {str(e)}")
-            
-            self.logger.info(f"인덱스 재구축 완료: {len(chunks)}개 청크")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"인덱스 재구축 실패: {str(e)}")
-            import traceback
-            self.logger.error(f"상세 오류: {traceback.format_exc()}")
-            return False
-    
-    async def rebuild_faiss_and_bm25_indexes_async(self) -> bool:
-        """
-        Qdrant에서 모든 문서를 읽어서 FAISS 및 BM25 인덱스 재생성 (비동기)
-        (문서 재업로드 없이 인덱스만 재구축)
-        
-        Returns:
-            재구축 성공 여부
-        """
-        import asyncio
-        
-        try:
-            self.logger.info("비동기 FAISS 및 BM25 인덱스 재구축 시작...")
-            
-            # 1. Qdrant에서 모든 문서 정보 가져오기 (I/O 작업 - 비동기화)
-            documents_info = await asyncio.to_thread(
-                self.vector_store_manager.get_documents_info
-            )
-            if not documents_info:
-                self.logger.warning("Qdrant에 문서가 없습니다. 문서를 먼저 업로드해주세요.")
-                return False
-            
-            self.logger.info(f"총 {len(documents_info)}개 문서 발견")
-            
-            # 2. 모든 문서의 청크 가져오기 (I/O 작업 - 비동기화)
-            all_chunks_data = []
-            for doc_info in documents_info:
-                source_file = doc_info.get('source_file', '')
-                if source_file:
-                    chunks_data = await asyncio.to_thread(
-                        self.vector_store_manager.get_document_chunks,
-                        source_file
-                    )
-                    all_chunks_data.extend(chunks_data)
-            
-            if not all_chunks_data:
-                self.logger.warning("청크 데이터를 가져올 수 없습니다.")
-                return False
-            
-            self.logger.info(f"총 {len(all_chunks_data)}개 청크 발견")
-            
-            # 3. 딕셔너리 형식을 DocumentChunk로 변환 (CPU 작업 - 동기)
-            from src.modules.document_processor import DocumentChunk
-            chunks = []
-            for chunk_data in all_chunks_data:
-                # content_full이 있으면 사용, 없으면 content_preview 사용
-                content = chunk_data.get('content_full', '')
-                if not content:
-                    content = chunk_data.get('content_preview', '')
-                
-                # metadata에서 source_file 추출 (여러 가능한 위치 확인)
-                metadata = chunk_data.get('metadata', {})
-                source_file = (
-                    metadata.get('source_file') or 
-                    metadata.get('file_path') or
-                    chunk_data.get('source_file', '')
-                )
-                
-                chunk = DocumentChunk(
-                    content=content,
-                    metadata=metadata,
-                    chunk_id=chunk_data.get('chunk_id', ''),
-                    source_file=source_file,
-                    chunk_index=chunk_data.get('chunk_index', 0)
-                )
-                chunks.append(chunk)
-            
-            # 4. FAISS 인덱스 생성 (I/O 작업 - 비동기화)
-            if hasattr(self.vector_store_manager, 'langchain_retrieval_manager') and \
-               self.vector_store_manager.langchain_retrieval_manager:
-                self.logger.info("FAISS 인덱스 생성 중...")
-                langchain_manager = self.vector_store_manager.langchain_retrieval_manager
-                faiss_success = await asyncio.to_thread(
-                    langchain_manager.initialize_faiss_from_chunks,
-                    chunks
-                )
-                if faiss_success:
-                    self.logger.info("FAISS 인덱스 생성 완료")
-                else:
-                    self.logger.error("FAISS 인덱스 생성 실패")
-                    return False
-            else:
-                self.logger.error("LangChain Retrieval Manager가 초기화되지 않았습니다.")
-                return False
-            
-            # 5. BM25 인덱스 구축 (I/O 작업 - 비동기화)
-            self.logger.info("BM25 인덱스 구축 중...")
-            bm25_success = await asyncio.to_thread(
-                self.vector_store_manager.build_bm25_index,
-                chunks
-            )
-            if bm25_success:
-                self.logger.info("BM25 인덱스 구축 완료")
-            else:
-                self.logger.error("BM25 인덱스 구축 실패")
-                return False
-            
-            # 6. EnsembleRetriever 초기화 (I/O 작업 - 비동기화)
-            if hasattr(self.vector_store_manager, 'langchain_retrieval_manager') and \
-               self.vector_store_manager.langchain_retrieval_manager:
-                try:
-                    from src.utils.config import get_qdrant_config
-                    qdrant_config = get_qdrant_config()
-                    faiss_weight = qdrant_config.hybrid_search_vector_weight if hasattr(qdrant_config, 'hybrid_search_vector_weight') else 0.7
-                    bm25_weight = qdrant_config.hybrid_search_bm25_weight if hasattr(qdrant_config, 'hybrid_search_bm25_weight') else 0.3
-                    rrf_c = qdrant_config.hybrid_search_rrf_k if hasattr(qdrant_config, 'hybrid_search_rrf_k') else 60
-                    
-                    await asyncio.to_thread(
-                        self.vector_store_manager.langchain_retrieval_manager.create_ensemble_retriever,
-                        faiss_weight=faiss_weight,
-                        bm25_weight=bm25_weight,
-                        c=rrf_c,
-                        k=self.rag_config.default_max_sources
-                    )
-                    self.logger.info("EnsembleRetriever 초기화 완료")
-                except Exception as e:
-                    self.logger.warning(f"EnsembleRetriever 초기화 실패: {str(e)}")
-            
-            self.logger.info(f"비동기 인덱스 재구축 완료: {len(chunks)}개 청크")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"비동기 인덱스 재구축 실패: {str(e)}")
-            import traceback
-            self.logger.error(f"상세 오류: {traceback.format_exc()}")
-            return False
-    
-    def clear_cache(self):
-        """캐시 초기화"""
-        self.embedding_manager.clear_cache()
-        self.logger.info("RAG 시스템 캐시가 초기화되었습니다")
-    
     def query_by_table_title(self, 
-                           table_title: str, 
-                           question: str = "", 
-                           max_sources: Optional[int] = None, 
-                           score_threshold: Optional[float] = None, 
-                           model_name: Optional[str] = None) -> RAGResponse:
+                            table_title: str, 
+                            question: str = "",
+                            max_sources: Optional[int] = None, 
+                            score_threshold: Optional[float] = None, 
+                            model_name: Optional[str] = None) -> RAGResponse:
         """표 제목으로 검색하여 질의응답"""
         start_time = time.time()
         
         try:
             self.logger.info(f"표 제목 검색 시작: {table_title}")
             
-            # 기본값 적용 (통일된 임계값 사용)
+            # 기본값 적용
             max_sources = max_sources if max_sources is not None else self.rag_config.default_max_sources_table
             score_threshold = score_threshold if score_threshold is not None else self.rag_config.score_threshold
-            
-            self.logger.info(f"표 제목 검색 파라미터: max_sources={max_sources}, score_threshold={score_threshold:.3f}")
             
             # 모델 변경 처리
             if model_name and model_name != self.llm_client.model_name:
                 self.logger.info(f"모델 변경: {self.llm_client.model_name} -> {model_name}")
-                # 설정에서 LLM 설정 가져오기
                 llm_config = self.config.model.get('llm')
                 model_config = {
                     'name': model_name,
@@ -1430,11 +1177,15 @@ class RAGSystem:
                 }
                 self.llm_client = OllamaLLMClient(model_config)
             
-            # 1. 표 제목으로 검색
-            similar_docs = self.vector_store_manager.search_by_table_title(
-                table_title=table_title,
-                limit=max_sources,
-                score_threshold=score_threshold
+            # 1. 표 제목으로 검색 (비동기 메서드 사용)
+            import asyncio
+            similar_docs = asyncio.run(
+                self.vector_store.search_with_table_filter_async(
+                    query=table_title,
+                    table_title=table_title,
+                    limit=max_sources,
+                    score_threshold=score_threshold
+                )
             )
             
             if not similar_docs:
@@ -1528,13 +1279,16 @@ class RAGSystem:
                 }
                 self.llm_client = OllamaLLMClient(model_config)
             
-            # 1. 필터와 함께 검색
-            similar_docs = self.vector_store_manager.search_with_table_filter(
-                query=question,
-                table_title=table_title,
-                is_table_data=is_table_data,
-                limit=max_sources,
-                score_threshold=score_threshold
+            # 1. 필터와 함께 검색 (비동기 메서드 사용)
+            import asyncio
+            similar_docs = asyncio.run(
+                self.vector_store.search_with_table_filter_async(
+                    query=question,
+                    table_title=table_title,
+                    is_table_data=is_table_data,
+                    limit=max_sources,
+                    score_threshold=score_threshold
+                )
             )
             
             if not similar_docs:
@@ -1687,7 +1441,7 @@ def setup_rag_system(input_dir: str, config: Optional[Dict[str, Any]] = None) ->
         
         # 벡터 저장소 설정 (컬렉션이 없으면 새로 생성)
         logger.info("벡터 저장소 컬렉션 설정 중...")
-        if not rag_system.vector_store_manager.setup_collection(force_recreate=False):
+        if not rag_system.vector_store.create_collection(force_recreate=False):
             logger.error("컬렉션 설정 실패")
             return False
         logger.info("벡터 저장소 컬렉션 설정 완료")

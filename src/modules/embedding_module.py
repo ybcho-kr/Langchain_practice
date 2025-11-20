@@ -11,10 +11,9 @@ import json
 import time
 import torch
 from sentence_transformers import SentenceTransformer
-from langchain_ollama import OllamaEmbeddings
-
 from src.utils.logger import get_logger, log_info, log_error
 from src.utils.config import get_embedding_config
+from src.utils.langchain_utils import create_ollama_embeddings
 
 
 @dataclass
@@ -191,11 +190,14 @@ class OllamaEmbeddingClient:
             self.max_length = config.max_length
             self.batch_size = config.batch_size
         
-        # langchain-ollama OllamaEmbeddings 초기화
-        self.embeddings = OllamaEmbeddings(
-            model=self.model_name,
+        # langchain-ollama OllamaEmbeddings 초기화 (유틸리티 함수 사용)
+        self.embeddings = create_ollama_embeddings(
+            model_name=self.model_name,
             base_url=self.base_url,
         )
+        
+        if not self.embeddings:
+            raise RuntimeError(f"OllamaEmbeddings 인스턴스 생성 실패: model={self.model_name}, base_url={self.base_url}")
         
         self.logger.info(
             f"Ollama 임베딩 클라이언트 초기화 (langchain-ollama): {self.model_name}, "

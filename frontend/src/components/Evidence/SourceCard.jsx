@@ -27,12 +27,12 @@ function SourceCard({ source, index, onViewFull }) {
   const safeScore = ((source.relevance_score || source.score || 0) * 100).toFixed(1);
   const scoreValue = parseFloat(safeScore);
 
-  // 관련도에 따른 색상 결정
+  // 관련도에 따른 색상 결정 (다크 테마에 맞게 밝은 색상 사용)
   const getScoreColor = (score) => {
-    if (score >= 80) return '#28a745'; // 녹색
-    if (score >= 60) return '#ffc107'; // 노란색
-    if (score >= 40) return '#fd7e14'; // 주황색
-    return '#dc3545'; // 빨간색
+    if (score >= 80) return '#4ade80'; // 밝은 녹색
+    if (score >= 60) return '#fbbf24'; // 밝은 노란색
+    if (score >= 40) return '#fb923c'; // 밝은 주황색
+    return '#f87171'; // 밝은 빨간색
   };
 
   const scoreColor = getScoreColor(scoreValue);
@@ -46,7 +46,8 @@ function SourceCard({ source, index, onViewFull }) {
 
   return (
     <div className="source-card" style={{
-      border: `2px solid ${scoreColor}40`,
+      background: '#40414f',
+      border: `1px solid ${scoreColor}40`,
       borderRadius: '8px',
       marginBottom: '16px',
       overflow: 'hidden',
@@ -60,10 +61,10 @@ function SourceCard({ source, index, onViewFull }) {
         justifyContent: 'space-between',
         alignItems: 'center',
         padding: '12px 16px',
-        background: `${scoreColor}10`,
+        background: `${scoreColor}15`,
         borderBottom: `1px solid ${scoreColor}30`,
       }}>
-        <div className="source-file" style={{ fontWeight: '500', fontSize: '0.95em' }}>
+        <div className="source-file" style={{ fontWeight: '500', fontSize: '0.95em', color: '#ececf1' }}>
           {index + 1}. {safeDisplayPath}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
@@ -72,7 +73,7 @@ function SourceCard({ source, index, onViewFull }) {
             <div style={{
               width: '120px',
               height: '8px',
-              backgroundColor: '#e9ecef',
+              backgroundColor: '#2d2d3a',
               borderRadius: '4px',
               overflow: 'hidden',
             }}>
@@ -100,7 +101,7 @@ function SourceCard({ source, index, onViewFull }) {
           padding: '16px',
           fontSize: '0.9em',
           lineHeight: '1.6',
-          color: '#333',
+          color: '#ececf1',
         }}
         dangerouslySetInnerHTML={{ __html: displayContent }} 
       />
@@ -112,7 +113,7 @@ function SourceCard({ source, index, onViewFull }) {
             style={{
               background: 'none',
               border: 'none',
-              color: '#007bff',
+              color: '#10a37f',
               cursor: 'pointer',
               fontSize: '0.85em',
               textDecoration: 'underline',
@@ -125,10 +126,10 @@ function SourceCard({ source, index, onViewFull }) {
       
       <div className="source-metadata" style={{
         padding: '10px 16px',
-        background: '#f8f9fa',
-        borderTop: '1px solid #dee2e6',
+        background: '#2d2d3a',
+        borderTop: '1px solid #565869',
         fontSize: '0.85em',
-        color: '#6c757d',
+        color: '#8e8ea0',
         display: 'flex',
         flexWrap: 'wrap',
         gap: '12px',
@@ -145,8 +146,8 @@ function SourceCard({ source, index, onViewFull }) {
       
       <div className="source-actions" style={{
         padding: '10px 16px',
-        background: '#f8f9fa',
-        borderTop: '1px solid #dee2e6',
+        background: '#2d2d3a',
+        borderTop: '1px solid #565869',
         textAlign: 'right',
       }}>
         <button
@@ -155,12 +156,15 @@ function SourceCard({ source, index, onViewFull }) {
           style={{
             padding: '6px 12px',
             fontSize: '0.875em',
-            background: '#007bff',
+            background: '#10a37f',
             color: 'white',
             border: 'none',
             borderRadius: '4px',
             cursor: 'pointer',
+            transition: 'background 0.2s',
           }}
+          onMouseEnter={(e) => e.currentTarget.style.background = '#0d8f6e'}
+          onMouseLeave={(e) => e.currentTarget.style.background = '#10a37f'}
         >
           📖 자세히 보기
         </button>

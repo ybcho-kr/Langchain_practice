@@ -8,13 +8,15 @@ import os
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 import time
+import requests
 
-from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from src.utils.langchain_utils import create_chat_ollama, convert_to_langchain_messages
 
 from src.utils.logger import get_logger, log_info, log_error
 from src.utils.config import get_llm_config
 from src.utils.helpers import is_general_question
+from src.utils.retry import retry_ollama_api, RetryConfig, CircuitBreaker
 
 
 @dataclass
@@ -39,7 +41,7 @@ class OllamaLLMClient:
         
         # 딕셔너리와 ModelConfig 객체 모두 처리
         if isinstance(config, dict):
-            self.model_name = config.get('name', 'llama3.1:8b')
+            self.model_name = config.get('name', 'gemma3:12b')
             self.base_url = config.get('base_url', 'http://localhost:11434')
             self.max_tokens = config.get('max_tokens', 1000)
             self.temperature = config.get('temperature', 0.1)
@@ -85,6 +87,16 @@ class OllamaLLMClient:
         
         # langchain-ollama ChatOllama 인스턴스는 필요 시 생성 (파라미터가 동적이므로)
         # self.llm은 사용하지 않고, 필요 시마다 ChatOllama 인스턴스를 생성
+        
+        # 서킷 브레이커 초기화 (Ollama API 전용)
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=5,
+            recovery_timeout=60.0,
+            expected_exception=Exception
+        )
+        
+        # 모델 정보 캐시 (동적 조회용)
+        self._model_info_cache: Optional[Dict[str, Any]] = None
         
         self.logger.info(
             f"Ollama LLM 클라이언트 초기화 (langchain-ollama): {self.model_name}, "
@@ -168,6 +180,157 @@ class OllamaLLMClient:
             self.logger.error(f"Ollama 서버 연결 실패: {str(e)}")
             return False
     
+    def get_model_info(self, use_cache: bool = True) -> Optional[Dict[str, Any]]:
+        """
+        Ollama API를 통해 모델 정보 조회 (컨텍스트 윈도우 크기 등)
+        
+        Args:
+            use_cache: 캐시된 정보 사용 여부 (기본값: True)
+            
+        Returns:
+            모델 정보 딕셔너리 (context_length, parameter_size 등 포함) 또는 None
+        """
+        if use_cache and self._model_info_cache is not None:
+            return self._model_info_cache
+        
+        try:
+            # Ollama API /api/show 엔드포인트 호출
+            api_url = f"{self.base_url}/api/show"
+            response = requests.post(
+                api_url,
+                json={"name": self.model_name},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                # 응답이 JSON인지 확인
+                try:
+                    model_info = response.json()
+                    # 딕셔너리인지 확인
+                    if not isinstance(model_info, dict):
+                        self.logger.warning(
+                            f"모델 정보가 딕셔너리가 아닙니다. 타입: {type(model_info)}, "
+                            f"값: {str(model_info)[:200]}"
+                        )
+                        return None
+                    
+                    self._model_info_cache = model_info
+                    self.logger.debug(f"모델 정보 조회 성공: {self.model_name}")
+                    return model_info
+                except ValueError as e:
+                    # JSON 파싱 실패 (텍스트 형식일 수 있음)
+                    self.logger.warning(
+                        f"모델 정보 JSON 파싱 실패: {str(e)}, "
+                        f"응답 타입: {type(response.text)}, "
+                        f"응답 내용: {response.text[:200]}"
+                    )
+                    return None
+            else:
+                self.logger.warning(
+                    f"모델 정보 조회 실패: HTTP {response.status_code}, "
+                    f"응답: {response.text[:200]}"
+                )
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            self.logger.warning(f"Ollama API 호출 실패 (모델 정보 조회): {str(e)}")
+            return None
+        except Exception as e:
+            self.logger.warning(f"모델 정보 조회 중 오류: {str(e)}")
+            return None
+    
+    def get_context_window_size(self) -> Optional[int]:
+        """
+        모델의 실제 컨텍스트 윈도우 크기 조회
+        
+        Returns:
+            컨텍스트 윈도우 크기 (토큰 수) 또는 None (조회 실패 시)
+        """
+        model_info = self.get_model_info()
+        if model_info is None:
+            return None
+        
+        # 딕셔너리인지 확인
+        if not isinstance(model_info, dict):
+            self.logger.warning(
+                f"모델 정보가 딕셔너리가 아닙니다. 타입: {type(model_info)}"
+            )
+            return None
+        
+        try:
+            # Ollama 모델 정보에서 컨텍스트 윈도우 크기 추출
+            # 여러 가능한 키 확인
+            context_size = None
+            
+            # 1. modelfile.parameter.num_ctx 확인
+            if 'modelfile' in model_info:
+                modelfile = model_info.get('modelfile')
+                if isinstance(modelfile, dict) and 'parameter' in modelfile:
+                    parameter = modelfile.get('parameter')
+                    if isinstance(parameter, dict):
+                        context_size = parameter.get('num_ctx') or parameter.get('context_length')
+            
+            # 2. details.context_length 확인
+            if context_size is None and 'details' in model_info:
+                details = model_info.get('details')
+                if isinstance(details, dict):
+                    context_size = details.get('context_length')
+            
+            # 3. parameter_size 확인
+            if context_size is None:
+                context_size = model_info.get('parameter_size')
+            
+            # 4. modelfile 텍스트에서 num_ctx 파싱 시도 (텍스트 형식인 경우)
+            if context_size is None and 'modelfile' in model_info:
+                modelfile = model_info.get('modelfile')
+                if isinstance(modelfile, str):
+                    # Modelfile 텍스트에서 num_ctx 파싱
+                    import re
+                    match = re.search(r'num_ctx\s+(\d+)', modelfile)
+                    if match:
+                        context_size = match.group(1)
+            
+            # 문자열로 반환되는 경우 정수로 변환
+            if context_size is not None:
+                try:
+                    if isinstance(context_size, str):
+                        # "8192" 같은 문자열 처리
+                        context_size = int(context_size)
+                    return int(context_size)
+                except (ValueError, TypeError):
+                    self.logger.warning(f"컨텍스트 윈도우 크기를 숫자로 변환할 수 없음: {context_size}")
+                    return None
+            
+            return None
+            
+        except Exception as e:
+            self.logger.warning(f"컨텍스트 윈도우 크기 추출 중 오류: {str(e)}")
+            return None
+    
+    def get_effective_max_tokens(self) -> int:
+        """
+        실제 사용 가능한 max_tokens 반환 (동적 조회 시도)
+        
+        Returns:
+            설정 파일의 max_tokens 또는 모델의 컨텍스트 윈도우 크기 중 작은 값
+        """
+        # 먼저 모델의 실제 컨텍스트 윈도우 크기 조회 시도
+        context_window = self.get_context_window_size()
+        
+        if context_window is not None:
+            # 컨텍스트 윈도우 크기를 찾았으면, 설정 파일의 max_tokens와 비교하여 작은 값 사용
+            # (컨텍스트 윈도우는 입력+출력 전체이므로, 출력용으로 일부 여유를 둠)
+            effective_max = min(self.max_tokens, context_window - 100)  # 100 토큰 여유
+            if effective_max != self.max_tokens:
+                self.logger.debug(
+                    f"모델 컨텍스트 윈도우 크기 ({context_window}) 기반으로 "
+                    f"max_tokens 조정: {self.max_tokens} → {effective_max}"
+                )
+            return effective_max
+        
+        # 모델 정보 조회 실패 시 설정 파일 값 사용
+        return self.max_tokens
+    
     def generate_text(self, prompt: str, **kwargs) -> Optional[LLMResponse]:
         """텍스트 생성 (langchain-ollama 사용)"""
         try:
@@ -180,15 +343,20 @@ class OllamaLLMClient:
             top_p = kwargs.get('top_p', self.top_p)
             max_tokens = kwargs.get('max_tokens', self.max_tokens)
             
-            # langchain-ollama ChatOllama 인스턴스 생성 (kwargs 파라미터 반영)
-            llm = ChatOllama(
-                model=self.model_name,
+            # LangChain 유틸리티를 사용하여 ChatOllama 인스턴스 생성
+            self.logger.debug(f"ChatOllama 생성: 모델={self.model_name}, num_predict={max_tokens}, temperature={temperature}, top_p={top_p}, timeout={self.timeout}초")
+            llm = create_chat_ollama(
+                model_name=self.model_name,
                 base_url=self.base_url,
                 temperature=temperature,
                 top_p=top_p,
-                num_predict=max_tokens,
+                max_tokens=max_tokens,
                 timeout=self.timeout,
             )
+            
+            if not llm:
+                self.logger.error("ChatOllama 인스턴스 생성 실패")
+                return None
             
             # HumanMessage로 프롬프트 전달
             response = llm.invoke([HumanMessage(content=prompt)])
@@ -221,7 +389,15 @@ class OllamaLLMClient:
         return result.text if result else "죄송합니다. 답변을 생성할 수 없습니다."
     
     def _get_system_prompt(self, has_rag_context: bool) -> str:
-        """시스템 프롬프트 생성"""
+        """
+        시스템 프롬프트 생성 (백업 버전 복원)
+        
+        Args:
+            has_rag_context: RAG 컨텍스트 포함 여부
+            
+        Returns:
+            시스템 프롬프트 문자열
+        """
         if has_rag_context:
             # RAG 컨텍스트가 있는 경우
             return """당신은 전기설비 진단 전문가입니다. 제공된 전문 지식을 바탕으로 질문에 정확하고 간결하게 답변해야 합니다.
@@ -258,7 +434,16 @@ class OllamaLLMClient:
 9. /no_thinking,/nothink,/no think,/no_thinking"""
 
     def _get_user_prompt(self, question: str, context: str = "") -> str:
-        """유저 프롬프트 생성"""
+        """
+        유저 프롬프트 생성 (백업 버전 복원)
+        
+        Args:
+            question: 사용자 질문
+            context: RAG 컨텍스트
+            
+        Returns:
+            유저 프롬프트 문자열
+        """
         if context:
             # RAG 컨텍스트가 있는 경우
             return f"""다음은 전기설비 진단에 관한 전문 지식입니다:
@@ -274,12 +459,19 @@ class OllamaLLMClient:
             return question
 
     def generate_answer_with_metadata(self, question: str, context: str = "", **kwargs) -> Optional[LLMResponse]:
-        """질문에 대한 답변 생성 (메타데이터 포함) - Chat API 사용"""
+        """
+        질문에 대한 답변 생성 (메타데이터 포함) - Chat API 사용 (백업 버전 복원)
+        
+        Args:
+            question: 사용자 질문
+            context: RAG 컨텍스트
+            **kwargs: 추가 파라미터
+        """
         # 일반적인 질문인지 확인
         is_general = is_general_question(question) and not context
         has_rag_context = bool(context and context.strip())
         
-        # 시스템 프롬프트와 유저 프롬프트 분리
+        # 시스템 프롬프트와 유저 프롬프트 분리 (직접 생성)
         system_prompt = self._get_system_prompt(has_rag_context)
         user_prompt = self._get_user_prompt(question, context)
         
@@ -301,42 +493,50 @@ class OllamaLLMClient:
             return None
 
     def _generate_chat(self, messages: List[Dict[str, str]], **kwargs) -> Optional[LLMResponse]:
-        """Chat API를 사용한 텍스트 생성 (langchain-ollama ChatOllama 사용)"""
+        """Chat API를 사용한 텍스트 생성 (langchain-ollama ChatOllama 사용, 재시도 로직 포함)"""
         if not self._check_server_status():
             self.logger.error("Ollama 서버가 실행되지 않았습니다")
             return None
         
+        # 재시도 로직 적용
+        @retry_ollama_api(max_attempts=3, initial_delay=2.0, max_delay=10.0)
+        def _call_ollama():
+            return self._generate_chat_internal(messages, **kwargs)
+        
+        try:
+            return _call_ollama()
+        except Exception as e:
+            self.logger.error(f"Ollama API 호출 최종 실패: {str(e)}")
+            return None
+    
+    def _generate_chat_internal(self, messages: List[Dict[str, str]], **kwargs) -> Optional[LLMResponse]:
+        """Chat API 내부 구현 (재시도 로직 제외)"""
         try:
             # kwargs에서 파라미터 추출
             temperature = kwargs.get('temperature', self.temperature)
             top_p = kwargs.get('top_p', self.top_p)
             max_tokens = kwargs.get('max_tokens', self.max_tokens)
             
-            # langchain-ollama ChatOllama 인스턴스 생성 (kwargs 파라미터 반영)
-            llm = ChatOllama(
-                model=self.model_name,
+            # LangChain 유틸리티를 사용하여 ChatOllama 인스턴스 생성
+            llm = create_chat_ollama(
+                model_name=self.model_name,
                 base_url=self.base_url,
                 temperature=temperature,
                 top_p=top_p,
-                num_predict=max_tokens,
+                max_tokens=max_tokens,
                 timeout=self.timeout,
             )
             
-            # LangChain 메시지 형식으로 변환
-            langchain_messages = []
-            for msg in messages:
-                role = msg.get('role', 'user')
-                content = msg.get('content', '')
-                
-                if role == 'system':
-                    langchain_messages.append(SystemMessage(content=content))
-                elif role == 'user':
-                    langchain_messages.append(HumanMessage(content=content))
-                elif role == 'assistant':
-                    langchain_messages.append(AIMessage(content=content))
-                else:
-                    # 기타 역할은 HumanMessage로 처리
-                    langchain_messages.append(HumanMessage(content=content))
+            if not llm:
+                self.logger.error("ChatOllama 인스턴스 생성 실패")
+                return None
+            
+            # LangChain 유틸리티를 사용하여 메시지 변환
+            langchain_messages = convert_to_langchain_messages(messages)
+            
+            if not langchain_messages:
+                self.logger.error("메시지 변환 실패")
+                return None
             
             start_time = time.time()
             response = llm.invoke(langchain_messages)
@@ -424,15 +624,19 @@ class OllamaLLMClient:
             top_p = kwargs.get('top_p', self.top_p)
             max_tokens = kwargs.get('max_tokens', self.max_tokens)
             
-            # langchain-ollama ChatOllama 인스턴스 생성
-            llm = ChatOllama(
-                model=self.model_name,
+            # LangChain 유틸리티를 사용하여 ChatOllama 인스턴스 생성
+            llm = create_chat_ollama(
+                model_name=self.model_name,
                 base_url=self.base_url,
                 temperature=temperature,
                 top_p=top_p,
-                num_predict=max_tokens,
+                max_tokens=max_tokens,
                 timeout=self.timeout,
             )
+            
+            if not llm:
+                self.logger.error("ChatOllama 인스턴스 생성 실패")
+                return None
             
             # 비동기 호출
             response = await llm.ainvoke([HumanMessage(content=prompt)])
@@ -460,12 +664,19 @@ class OllamaLLMClient:
             return None
     
     async def generate_answer_async(self, question: str, context: str = "", **kwargs) -> Optional[LLMResponse]:
-        """비동기 질문에 대한 답변 생성 (메타데이터 포함)"""
+        """
+        비동기 질문에 대한 답변 생성 (메타데이터 포함) - 백업 버전 복원
+        
+        Args:
+            question: 사용자 질문
+            context: RAG 컨텍스트
+            **kwargs: 추가 파라미터
+        """
         # 일반적인 질문인지 확인
         is_general = is_general_question(question) and not context
         has_rag_context = bool(context and context.strip())
         
-        # 시스템 프롬프트와 유저 프롬프트 분리
+        # 시스템 프롬프트와 유저 프롬프트 분리 (직접 생성)
         system_prompt = self._get_system_prompt(has_rag_context)
         user_prompt = self._get_user_prompt(question, context)
         
@@ -487,41 +698,73 @@ class OllamaLLMClient:
             return None
     
     async def _generate_chat_async(self, messages: List[Dict[str, str]], **kwargs) -> Optional[LLMResponse]:
-        """비동기 Chat API를 사용한 텍스트 생성"""
+        """비동기 Chat API를 사용한 텍스트 생성 (재시도 로직 포함)"""
         if not self._check_server_status():
             self.logger.error("Ollama 서버가 실행되지 않았습니다")
             return None
         
+        # 재시도 로직 적용
+        from src.utils.retry import retry_with_backoff, RetryConfig
+        
+        retry_config = RetryConfig(
+            max_attempts=3,
+            initial_delay=2.0,
+            max_delay=10.0,
+            exponential_base=2.0,
+            jitter=True,
+            retry_on=(Exception,)
+        )
+        
+        @retry_with_backoff(config=retry_config, circuit_breaker=self.circuit_breaker)
+        async def _call_ollama_async():
+            return await self._generate_chat_async_internal(messages, **kwargs)
+        
+        try:
+            return await _call_ollama_async()
+        except Exception as e:
+            self.logger.error(f"Ollama API 비동기 호출 최종 실패: {str(e)}")
+            return None
+    
+    async def _generate_chat_async_internal(self, messages: List[Dict[str, str]], **kwargs) -> Optional[LLMResponse]:
+        """비동기 Chat API 내부 구현 (재시도 로직 제외)"""
         try:
             # kwargs에서 파라미터 추출
             temperature = kwargs.get('temperature', self.temperature)
             top_p = kwargs.get('top_p', self.top_p)
             max_tokens = kwargs.get('max_tokens', self.max_tokens)
             
-            # langchain-ollama ChatOllama 인스턴스 생성
-            llm = ChatOllama(
-                model=self.model_name,
+            # LangChain 유틸리티를 사용하여 ChatOllama 인스턴스 생성
+            self.logger.debug(
+                f"ChatOllama 생성 (비동기): 모델={self.model_name}, num_predict={max_tokens} "
+                f"(설정값: {self.max_tokens}), temperature={temperature}, top_p={top_p}, timeout={self.timeout}초"
+            )
+            llm = create_chat_ollama(
+                model_name=self.model_name,
                 base_url=self.base_url,
                 temperature=temperature,
                 top_p=top_p,
-                num_predict=max_tokens,
+                max_tokens=max_tokens,
                 timeout=self.timeout,
             )
             
-            # LangChain 메시지 형식으로 변환
-            langchain_messages = []
-            for msg in messages:
-                role = msg.get('role', 'user')
-                content = msg.get('content', '')
-                
-                if role == 'system':
-                    langchain_messages.append(SystemMessage(content=content))
-                elif role == 'user':
-                    langchain_messages.append(HumanMessage(content=content))
-                elif role == 'assistant':
-                    langchain_messages.append(AIMessage(content=content))
-                else:
-                    langchain_messages.append(HumanMessage(content=content))
+            if not llm:
+                self.logger.error("ChatOllama 인스턴스 생성 실패")
+                return None
+            
+            # LangChain 유틸리티를 사용하여 메시지 변환
+            langchain_messages = convert_to_langchain_messages(messages)
+            
+            if not langchain_messages:
+                self.logger.error("메시지 변환 실패")
+                return None
+            
+            # 프롬프트 크기 확인
+            total_prompt_length = sum(len(msg.get('content', '')) for msg in messages)
+            estimated_prompt_tokens = int(total_prompt_length / 2.5)  # 한국어 기준 토큰 추정
+            self.logger.debug(
+                f"Ollama API 호출 시작: 모델={self.model_name}, num_predict={max_tokens}, "
+                f"프롬프트 길이={total_prompt_length}자 (추정 {estimated_prompt_tokens}토큰), timeout={self.timeout}초"
+            )
             
             start_time = time.time()
             # 비동기 호출
@@ -530,13 +773,64 @@ class OllamaLLMClient:
             
             generated_text = response.content if hasattr(response, 'content') else str(response)
             
-            # 사용된 토큰 수 추출
+            # 사용된 토큰 수 추출 (다양한 경로 시도)
             tokens_used = None
-            if hasattr(response, 'response_metadata'):
-                usage = response.response_metadata.get('usage', {})
-                tokens_used = usage.get('total_tokens') or usage.get('eval_count')
+            prompt_tokens = None
+            completion_tokens = None
             
-            self.logger.debug(f"비동기 Chat API 텍스트 생성 완료: {len(generated_text)}자, {processing_time:.2f}초")
+            # 1. response_metadata에서 추출 시도
+            if hasattr(response, 'response_metadata'):
+                metadata = response.response_metadata
+                self.logger.debug(f"response_metadata 내용: {metadata}")
+                
+                if isinstance(metadata, dict):
+                    usage = metadata.get('usage', {})
+                    if isinstance(usage, dict):
+                        tokens_used = (
+                            usage.get('total_tokens') or 
+                            usage.get('eval_count') or
+                            usage.get('prompt_eval_count')
+                        )
+                        prompt_tokens = usage.get('prompt_tokens') or usage.get('prompt_eval_count')
+                        completion_tokens = usage.get('completion_tokens') or usage.get('eval_count')
+            
+            # 2. response 객체의 다른 속성 확인
+            if tokens_used is None:
+                # response 객체의 모든 속성 확인 (디버깅용)
+                response_attrs = dir(response)
+                self.logger.debug(f"response 객체 속성: {[attr for attr in response_attrs if not attr.startswith('_')]}")
+                
+                # usage 속성 직접 확인
+                if hasattr(response, 'usage'):
+                    usage_attr = getattr(response, 'usage')
+                    self.logger.debug(f"response.usage: {usage_attr}")
+                    if isinstance(usage_attr, dict):
+                        tokens_used = usage_attr.get('total_tokens') or usage_attr.get('eval_count')
+            
+            # 3. 생성된 텍스트로부터 추정 토큰 수 계산 (한국어 기준: 1토큰 ≈ 2.5자)
+            estimated_output_tokens = int(len(generated_text) / 2.5) if generated_text else 0
+            estimated_input_tokens = estimated_prompt_tokens
+            
+            # 토큰 정보 로깅
+            tokens_per_sec = estimated_output_tokens / processing_time if processing_time > 0 else 0
+            
+            if tokens_used:
+                self.logger.info(
+                    f"비동기 Chat API 텍스트 생성 완료: {len(generated_text)}자, {processing_time:.2f}초, "
+                    f"토큰={tokens_used} (입력: {prompt_tokens or estimated_input_tokens}, 출력: {completion_tokens or estimated_output_tokens}), "
+                    f"속도={tokens_per_sec:.1f}토큰/초, 모델={self.model_name}"
+                )
+            else:
+                # 토큰 정보가 없으면 추정값 사용
+                total_estimated_tokens = estimated_input_tokens + estimated_output_tokens
+                actual_used = estimated_output_tokens if estimated_output_tokens < max_tokens else f"{max_tokens}(제한)"
+                self.logger.info(
+                    f"비동기 Chat API 텍스트 생성 완료: {len(generated_text)}자, {processing_time:.2f}초, "
+                    f"토큰=추정 {total_estimated_tokens} (입력: {estimated_input_tokens}, 출력: {estimated_output_tokens}), "
+                    f"속도={tokens_per_sec:.1f}토큰/초, 모델={self.model_name}, "
+                    f"num_predict={max_tokens} (실제 생성: {actual_used})"
+                )
+                tokens_used = total_estimated_tokens
             
             return LLMResponse(
                 text=generated_text,
@@ -546,20 +840,38 @@ class OllamaLLMClient:
             )
                 
         except Exception as e:
+            import traceback
             self.logger.error(f"비동기 Chat API 텍스트 생성 중 오류: {str(e)}")
+            self.logger.error(f"상세 오류 정보:\n{traceback.format_exc()}")
+            
+            # Ollama 서버 연결 실패인지 확인
+            error_str = str(e).lower()
+            if 'connection' in error_str or 'timeout' in error_str or 'refused' in error_str:
+                self.logger.error(f"Ollama 서버 연결 실패: {self.base_url}, 모델: {self.model_name}")
+                return None
+            
             # Chat API 실패 시 기존 generate_text_async로 폴백
             self.logger.warning("비동기 Chat API 실패, 기존 generate_text_async로 폴백")
-            # 메시지를 단일 프롬프트로 변환
-            prompt_parts = []
-            for msg in messages:
-                role = msg.get('role', 'user')
-                content = msg.get('content', '')
-                if role == 'system':
-                    prompt_parts.append(f"시스템 지시사항:\n{content}")
-                elif role == 'user':
-                    prompt_parts.append(f"사용자 질문:\n{content}")
-            prompt = "\n\n".join(prompt_parts)
-            return await self.generate_text_async(prompt, **kwargs)
+            try:
+                # 메시지를 단일 프롬프트로 변환
+                prompt_parts = []
+                for msg in messages:
+                    role = msg.get('role', 'user')
+                    content = msg.get('content', '')
+                    if role == 'system':
+                        prompt_parts.append(f"시스템 지시사항:\n{content}")
+                    elif role == 'user':
+                        prompt_parts.append(f"사용자 질문:\n{content}")
+                prompt = "\n\n".join(prompt_parts)
+                fallback_result = await self.generate_text_async(prompt, **kwargs)
+                if fallback_result:
+                    return fallback_result
+                else:
+                    self.logger.error("폴백 generate_text_async도 실패했습니다.")
+                    return None
+            except Exception as fallback_error:
+                self.logger.error(f"폴백 generate_text_async 중 오류: {str(fallback_error)}")
+                return None
 
 
 def create_llm_client(config: Optional[Dict[str, Any]] = None) -> OllamaLLMClient:

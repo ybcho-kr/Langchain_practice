@@ -54,6 +54,8 @@ class QdrantConfig(BaseModel):
     hybrid_search_sparse_weight: float = 0.3  # Sparse 검색 가중치 (Qdrant 하이브리드 검색용)
     sparse_vocabulary_path: str = "data/sparse_vocabulary"  # Sparse Vocabulary 저장 경로
     sparse_use_morphological: bool = True  # 형태소 분석 사용 여부 (KoNLPy 필요, 없으면 자동 폴백)
+    sparse_use_kiwipiepy: bool = True  # Kiwipiepy 기반 형태소 전처리 활성화 여부
+    kiwipiepy_dictionary_path: Optional[str] = None  # Kiwipiepy 사용자 사전 경로
     sparse_include_doc_stats: bool = True  # doc_freqs/doc_len 저장 여부 (기본값: false, 파일 크기 증가)
 
 
@@ -89,6 +91,7 @@ class RAGConfig(BaseModel):
     score_threshold: float = 0.7  # 통일된 검색 점수 임계값 (웹 인터페이스와 동일)
     content_preview_length: int = 300  # 소스 내용 미리보기 길이
     low_score_general_threshold: float = 0.3  # 낮은 점수 시 일반 질문으로 처리할 임계값 (일반 질문 판별용)
+    context_token_ratio: float = 0.7  # 컨텍스트 토큰 비율 (LLM max_tokens 대비, 0.0-1.0). 나머지는 답변 생성용
 
 
 class RerankerConfig(BaseModel):
@@ -99,6 +102,22 @@ class RerankerConfig(BaseModel):
     top_k: int = 10
     batch_size: int = 32
     alpha: float = 0.7
+
+
+class SessionConfig(BaseModel):
+    """세션 관리 설정"""
+    enabled: bool = True
+    storage_path: str = "data/sessions"
+    use_sqlite: bool = True
+    max_context_length: int = 4000
+    max_turns: int = 50
+    timeout_minutes: int = 60
+    session_ttl: int = 3600
+    cleanup_interval_seconds: int = 300
+    max_memory_per_session_mb: int = 100
+    max_total_memory_mb: int = 1024
+    max_sessions: int = 1000
+    expose_metrics: bool = False
 
 
 class Stage1Config(BaseModel):
@@ -115,6 +134,7 @@ class Stage1Config(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     rag: RAGConfig = Field(default_factory=RAGConfig)
     reranker: RerankerConfig = Field(default_factory=RerankerConfig)
+    session: SessionConfig = Field(default_factory=SessionConfig)
     feature_flags: Optional[Dict[str, Any]] = None
     agentic: Optional[Dict[str, Any]] = None    
 
@@ -157,6 +177,9 @@ class ConfigManager:
         
         if 'reranker' in config_data:
             config_data['reranker'] = RerankerConfig(**config_data['reranker'])
+        
+        if 'session' in config_data:
+            config_data['session'] = SessionConfig(**config_data['session'])
         
         self._config = Stage1Config(**config_data)
         return self._config
@@ -248,3 +271,9 @@ def get_rag_config() -> RAGConfig:
     """RAG 설정 반환"""
     config = config_manager.get_config()
     return config.rag
+
+
+def get_session_config() -> SessionConfig:
+    """세션 설정 반환"""
+    config = config_manager.get_config()
+    return config.session

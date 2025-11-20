@@ -176,22 +176,27 @@ export default function VocabularyView() {
                       <strong style={{ color: '#ececf1' }}>반환된 항목 수:</strong> {vocabularyData.statistics.returned_count?.toLocaleString() || 0}개
                     </div>
                     <div style={{ color: '#8e8ea0' }}>
-                      <strong style={{ color: '#ececf1' }}>IDF 최소값:</strong> {vocabularyData.statistics.idf_min?.toFixed(4) || '0.0000'}
+                      <strong style={{ color: '#ececf1' }}>IDF 최소값:</strong> {vocabularyData.statistics.min_idf?.toFixed(4) || vocabularyData.statistics.idf_min?.toFixed(4) || '0.0000'}
                     </div>
                     <div style={{ color: '#8e8ea0' }}>
-                      <strong style={{ color: '#ececf1' }}>IDF 최대값:</strong> {vocabularyData.statistics.idf_max?.toFixed(4) || '0.0000'}
+                      <strong style={{ color: '#ececf1' }}>IDF 최대값:</strong> {vocabularyData.statistics.max_idf?.toFixed(4) || vocabularyData.statistics.idf_max?.toFixed(4) || '0.0000'}
                     </div>
                     <div style={{ color: '#8e8ea0' }}>
-                      <strong style={{ color: '#ececf1' }}>IDF 평균값:</strong> {vocabularyData.statistics.idf_mean?.toFixed(4) || '0.0000'}
+                      <strong style={{ color: '#ececf1' }}>IDF 평균값:</strong> {vocabularyData.statistics.avg_idf?.toFixed(4) || vocabularyData.statistics.idf_mean?.toFixed(4) || '0.0000'}
                     </div>
                   </div>
                   {vocabularyData.statistics.top_tokens && vocabularyData.statistics.top_tokens.length > 0 && (
                     <div style={{ marginTop: '15px' }}>
                       <strong style={{ color: '#ececf1' }}>🔝 상위 10개 토큰 (IDF 값 기준):</strong>
                       <div style={{ marginTop: '10px', display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
-                        {vocabularyData.statistics.top_tokens.map((token, idx) => {
-                          const idfValue = vocabularyData.idf_values?.[token] || 0;
-                          const index = vocabularyData.vocabulary?.[token] || -1;
+                        {vocabularyData.statistics.top_tokens.map((tokenInfo, idx) => {
+                          // tokenInfo는 객체: {index, idf, df, token_text, token_word}
+                          const tokenIndex = typeof tokenInfo === 'object' ? tokenInfo.index : tokenInfo;
+                          const idfValue = typeof tokenInfo === 'object' ? tokenInfo.idf : (vocabularyData.idf_values?.[tokenIndex] || 0);
+                          const df = typeof tokenInfo === 'object' ? tokenInfo.df : (vocabularyData.vocabulary?.[tokenIndex]?.document_frequency || 0);
+                          const tokenText = typeof tokenInfo === 'object' ? tokenInfo.token_text : null;
+                          const tokenWord = typeof tokenInfo === 'object' ? tokenInfo.token_word : null;
+                          const displayText = tokenWord || tokenText || tokenIndex;
                           return (
                             <div
                               key={idx}
@@ -203,9 +208,9 @@ export default function VocabularyView() {
                                 fontSize: '0.9em',
                                 color: '#ececf1',
                               }}
-                              title={`인덱스: ${index}, IDF: ${idfValue.toFixed(4)}`}
+                              title={`인덱스: ${tokenIndex}, 단어: ${tokenWord || tokenText || 'N/A'}, IDF: ${idfValue.toFixed(4)}, DF: ${df}`}
                             >
-                              {token} <span style={{ color: '#8e8ea0', fontSize: '0.85em' }}>({idfValue.toFixed(2)})</span>
+                              <strong>{displayText}</strong> <span style={{ color: '#8e8ea0', fontSize: '0.75em' }}>(#{tokenIndex}, IDF: {idfValue.toFixed(2)})</span>
                             </div>
                           );
                         })}
@@ -223,7 +228,7 @@ export default function VocabularyView() {
                     <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                       <thead style={{ position: 'sticky', top: 0, background: '#40414f', zIndex: 1 }}>
                         <tr>
-                          <th style={{ padding: '10px', textAlign: 'left', borderBottom: '2px solid #565869', color: '#ececf1' }}>토큰</th>
+                          <th style={{ padding: '10px', textAlign: 'left', borderBottom: '2px solid #565869', color: '#ececf1' }}>단어/토큰</th>
                           <th style={{ padding: '10px', textAlign: 'right', borderBottom: '2px solid #565869', color: '#ececf1' }}>인덱스</th>
                           <th style={{ padding: '10px', textAlign: 'right', borderBottom: '2px solid #565869', color: '#ececf1' }}>IDF 값</th>
                         </tr>
@@ -231,17 +236,32 @@ export default function VocabularyView() {
                       <tbody>
                         {Object.entries(vocabularyData.vocabulary)
                           .sort((a, b) => {
-                            const idfA = vocabularyData.idf_values?.[a[0]] || 0;
-                            const idfB = vocabularyData.idf_values?.[b[0]] || 0;
+                            const tokenIdxA = a[0];
+                            const tokenIdxB = b[0];
+                            const idfA = vocabularyData.idf_values?.[tokenIdxA] || 0;
+                            const idfB = vocabularyData.idf_values?.[tokenIdxB] || 0;
                             return idfB - idfA; // IDF 값 기준 내림차순
                           })
-                          .map(([token, index]) => {
-                            const idfValue = vocabularyData.idf_values?.[token] || 0;
+                          .map(([tokenIndex, vocabInfo]) => {
+                            // vocabInfo는 객체: {index, document_frequency, avg_weight, max_weight, min_weight, total_occurrences, token_text, token_word}
+                            const tokenIdx = typeof vocabInfo === 'object' ? (vocabInfo.index || tokenIndex) : tokenIndex;
+                            const idfValue = vocabularyData.idf_values?.[tokenIndex] || 0;
+                            const df = typeof vocabInfo === 'object' ? vocabInfo.document_frequency : 0;
+                            const tokenText = typeof vocabInfo === 'object' ? vocabInfo.token_text : null;
+                            const tokenWord = typeof vocabInfo === 'object' ? vocabInfo.token_word : null;
+                            const displayText = tokenWord || tokenText || `#${tokenIndex}`;
                             return (
-                              <tr key={token} style={{ borderBottom: '1px solid #565869' }}>
-                                <td style={{ padding: '8px 10px', wordBreak: 'break-word', color: '#ececf1' }}>{token}</td>
+                              <tr key={tokenIndex} style={{ borderBottom: '1px solid #565869' }}>
+                                <td style={{ padding: '8px 10px', wordBreak: 'break-word', color: '#ececf1' }}>
+                                  <strong>{displayText}</strong>
+                                  {tokenWord && tokenText && tokenWord !== tokenText && (
+                                    <span style={{ color: '#8e8ea0', fontSize: '0.85em', marginLeft: '8px' }}>
+                                      ({tokenText})
+                                    </span>
+                                  )}
+                                </td>
                                 <td style={{ padding: '8px 10px', textAlign: 'right', fontFamily: 'monospace', color: '#8e8ea0' }}>
-                                  {index}
+                                  {tokenIdx}
                                 </td>
                                 <td style={{ padding: '8px 10px', textAlign: 'right', fontFamily: 'monospace', color: '#8e8ea0' }}>
                                   {idfValue.toFixed(4)}

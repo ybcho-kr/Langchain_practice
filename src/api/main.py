@@ -2,10 +2,12 @@
 FastAPI 기반 REST API 서버
 """
 
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Query
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
-from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field, field_validator, model_validator
+from contextlib import asynccontextmanager
+from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import time
 import uvicorn
 import shutil
@@ -14,16 +16,84 @@ from pathlib import Path
 from src.utils.logger import setup_logging, get_logger
 from src.utils.config import get_config, get_api_config
 from src.modules.rag_system import RAGSystem, RAGResponse
+from src.utils.langchain_utils import create_chat_ollama_from_config, create_simple_message
+
+if TYPE_CHECKING:
+    from src.session.session_manager import SessionManager
+
+# 메트릭 API 라우터 포함
+try:
+    from src.api.metrics import router as metrics_router
+except ImportError:
+    metrics_router = None
 
 
-class RebuildIndexesResponse(BaseModel):
-    """인덱스 재구축 응답"""
-    success: bool
-    message: str
-    chunks_count: Optional[int] = None
+# RebuildIndexesResponse 클래스 제거됨 (FAISS/BM25 제거)
 
 
 # 요청/응답 모델
+# 세션 관리자 전역 인스턴스
+_session_manager: Optional["SessionManager"] = None
+
+
+def get_session_manager() -> "SessionManager":
+    """세션 관리자 싱글톤"""
+    global _session_manager
+    if _session_manager is None:
+        from src.utils.config import get_session_config
+        from src.utils.logger import get_logger
+        logger = get_logger()
+        
+        session_config = get_session_config()
+        logger.info(
+            f"세션 설정 로드: storage_path={session_config.storage_path}, "
+            f"use_sqlite={session_config.use_sqlite}, "
+            f"session_ttl={session_config.session_ttl}, "
+            f"cleanup_interval={session_config.cleanup_interval_seconds}"
+        )
+        
+        from src.session.session_manager import SessionManager
+        _session_manager = SessionManager(session_config=session_config)
+    
+    return _session_manager
+
+
+class SessionCreateResponse(BaseModel):
+    """세션 생성 응답"""
+    session_id: str = Field(..., description="생성된 세션 ID")
+
+
+class SessionInfo(BaseModel):
+    """세션 정보"""
+    session_id: str = Field(..., description="세션 ID", json_schema_extra={"example": "session-12345"})
+    title: str = Field(..., description="세션 제목 (첫 메시지 또는 '새 대화')", json_schema_extra={"example": "변압기 진단 기준은?"})
+    last_message: str = Field(..., description="마지막 메시지 미리보기", json_schema_extra={"example": "변압기 진단 기준은 다음과 같습니다..."})
+    created_at: float = Field(..., description="생성 시간 (Unix timestamp)", json_schema_extra={"example": 1704067200.0})
+    last_accessed: float = Field(..., description="마지막 접근 시간 (Unix timestamp)", json_schema_extra={"example": 1704067260.0})
+    message_count: int = Field(..., description="메시지 수", json_schema_extra={"example": 5})
+
+
+class SessionListResponse(BaseModel):
+    """세션 목록 응답"""
+    sessions: List[SessionInfo] = Field(..., description="세션 목록", json_schema_extra={"example": []})
+    total_count: int = Field(..., description="총 세션 수", json_schema_extra={"example": 10})
+
+
+class SessionHistoryResponse(BaseModel):
+    """세션 히스토리 응답"""
+    session_id: str = Field(..., description="세션 ID")
+    history: List[Dict[str, Any]] = Field(..., description="메시지 히스토리")
+
+
+class SessionStatsResponse(BaseModel):
+    """세션 통계 응답"""
+    total_sessions: int = Field(..., description="총 세션 수")
+    total_memory_mb: float = Field(..., description="전체 메모리 사용량 (MB)")
+    oldest_session_age: float = Field(..., description="가장 오래된 세션 연령 (초)")
+    newest_session_age: float = Field(..., description="가장 최근 세션 연령 (초)")
+    active_sessions: int = Field(..., description="활성 세션 수")
+
+
 class QueryRequest(BaseModel):
     """
     RAG 질의응답 요청 모델
@@ -35,159 +105,69 @@ class QueryRequest(BaseModel):
         description="사용자 질문 (1-1000자)",
         min_length=1,
         max_length=1000,
-        example="변압기 진단 기준은 무엇인가요?"
+        json_schema_extra={"example": "변압기 진단 기준은 무엇인가요?"}
     )
     max_sources: int = Field(
         default=5,
         description="검색 결과로 반환할 최대 소스 문서 수 (1-20)",
         ge=1,
         le=20,
-        example=5
+        json_schema_extra={"example": 5}
     )
     score_threshold: float = Field(
         default=0.7,
         description="유사도 점수 임계값 (0.0-1.0). 이 값보다 낮은 점수의 문서는 제외됩니다.",
         ge=0.0,
         le=1.0,
-        example=0.7
+        json_schema_extra={"example": 0.7}
     )
     temperature: Optional[float] = Field(
         default=None,
         description="LLM 생성 온도 (0.0-2.0). 높을수록 창의적인 답변, 낮을수록 일관된 답변. None이면 설정 파일 값 사용",
         ge=0.0,
         le=2.0,
-        example=0.1
+        json_schema_extra={"example": 0.1}
     )
     model: Optional[str] = Field(
         default=None,
         description="사용할 LLM 모델명 (예: 'gemma3:4b', 'llama3.1:8b'). None이면 설정 파일의 기본 모델 사용",
-        example="gemma3:4b"
+        json_schema_extra={"example": "gemma3:4b"}
     )
-    use_qdrant: bool = Field(
-        default=True,
-        description="Qdrant 벡터 검색 사용 여부. Qdrant와 FAISS는 동시에 선택할 수 없습니다.",
-        example=True
-    )
-    use_faiss: bool = Field(
-        default=False,
-        description="FAISS 벡터 검색 사용 여부 (GPU 가속 지원). Qdrant와 FAISS는 동시에 선택할 수 없습니다.",
-        example=False
-    )
-    use_bm25: bool = Field(
-        default=False,
-        description="BM25 키워드 검색 사용 여부 (숨김 처리됨 - Qdrant만 사용).",
-        example=False
-    )
+    # Qdrant만 사용 (FAISS/BM25 제거됨)
     use_reranker: bool = Field(
         default=True,
         description="리랭커 사용 여부. CrossEncoder를 사용하여 검색 결과를 재정렬합니다.",
-        example=True
+        json_schema_extra={"example": True}
     )
     reranker_alpha: float = Field(
         default=0.7,
         description="리랭커 점수 가중치 (0.0-1.0). 1.0에 가까울수록 리랭커 점수를 더 많이 반영합니다.",
         ge=0.0,
         le=1.0,
-        example=0.7
+        json_schema_extra={"example": 0.7}
     )
-    reranker_top_k: Optional[int] = Field(
-        default=None,
-        description="리랭커에 전달할 상위 K 후보 수 (1-50). None이면 max_sources 값 사용",
-        ge=1,
-        le=50,
-        example=10
-    )
-    weights: Optional[Dict[str, float]] = Field(
-        default=None,
-        description="검색기 가중치 딕셔너리. 예: {'qdrant': 0.7, 'faiss': 0.0, 'bm25': 0.3}. None이면 자동 계산",
-        example={"qdrant": 0.7, "faiss": 0.0, "bm25": 0.3}
-    )
+    # reranker_top_k와 weights 필드 제거됨 (Qdrant만 사용)
     dense_weight: Optional[float] = Field(
         default=None,
         description="Qdrant 하이브리드 검색의 Dense 벡터 가중치 (0.0-1.0). None이면 config.yaml의 기본값 사용. Sparse 벡터가 활성화되어 있을 때만 의미가 있습니다.",
         ge=0.0,
         le=1.0,
-        example=0.7
+        json_schema_extra={"example": 0.7}
     )
     sparse_weight: Optional[float] = Field(
         default=None,
         description="Qdrant 하이브리드 검색의 Sparse 벡터 가중치 (0.0-1.0). None이면 config.yaml의 기본값 사용. Sparse 벡터가 활성화되어 있을 때만 의미가 있습니다.",
         ge=0.0,
         le=1.0,
-        example=0.3
+        json_schema_extra={"example": 0.3}
+    )
+    session_id: Optional[str] = Field(
+        default=None,
+        description="세션 ID (선택적). 멀티턴 대화를 위해 사용됩니다.",
+        json_schema_extra={"example": "session-12345"}
     )
     
-    @validator('use_bm25', always=True)
-    def validate_at_least_one_retriever(cls, v, values):
-        """Qdrant만 사용 (FAISS, BM25는 숨김 처리됨)"""
-        use_qdrant = values.get('use_qdrant', True)
-        use_faiss = values.get('use_faiss', False)
-        use_bm25 = v
-        
-        # Qdrant만 사용하도록 강제
-        if not use_qdrant:
-            raise ValueError('Qdrant 검색기는 필수입니다. (FAISS, BM25는 현재 사용할 수 없습니다)')
-        
-        # Qdrant와 FAISS는 배타적 선택 (FAISS는 숨김 처리되었지만 검증은 유지)
-        if use_qdrant and use_faiss:
-            raise ValueError('Qdrant와 FAISS는 동시에 선택할 수 없습니다. Qdrant만 사용하세요.')
-        
-        return v
-
-    @validator('weights', always=True)
-    def normalize_weights(cls, v, values):
-        """가중치 정규화: Qdrant/FAISS 배타, BM25 독립. BM25 선택 시 (vector+bm25)=1."""
-        if v is None:
-            # 기본값: BM25 미선택이면 선택된 벡터=1, BM25 선택이면 vector/bm25 균등
-            use_q = values.get('use_qdrant', True)
-            use_f = values.get('use_faiss', False)
-            use_b = values.get('use_bm25', True)
-            if use_q and not use_f:
-                if use_b:
-                    return {'qdrant': 0.7, 'faiss': 0.0, 'bm25': 0.3}
-                return {'qdrant': 1.0, 'faiss': 0.0, 'bm25': 0.0}
-            if use_f and not use_q:
-                if use_b:
-                    return {'qdrant': 0.0, 'faiss': 0.5, 'bm25': 0.5}
-                return {'qdrant': 0.0, 'faiss': 1.0, 'bm25': 0.0}
-            if use_b:
-                return {'qdrant': 0.0, 'faiss': 0.0, 'bm25': 1.0}
-            return {'qdrant': 1.0, 'faiss': 0.0, 'bm25': 0.0}
-        # 입력 가중치 정리
-        wq = float(v.get('qdrant', 0.0))
-        wf = float(v.get('faiss', 0.0))
-        wb = float(v.get('bm25', 0.0))
-        # 선택되지 않은 검색기는 0 강제, 배타성 반영
-        use_q = values.get('use_qdrant', True)
-        use_f = values.get('use_faiss', False)
-        use_b = values.get('use_bm25', False)
-        if not use_q:
-            wq = 0.0
-        if not use_f:
-            wf = 0.0
-        if not use_b:
-            wb = 0.0
-        # 배타 규칙: 둘 다 true인 상태는 이전 validator에서 차단
-        if use_b:
-            # BM25 포함: (vector + bm25) = 1
-            vector = wq if use_q else (wf if use_f else 0.0)
-            total = vector + wb
-            if total <= 0:
-                if use_q:
-                    return {'qdrant': 0.5, 'faiss': 0.0, 'bm25': 0.5}
-                if use_f:
-                    return {'qdrant': 0.0, 'faiss': 0.5, 'bm25': 0.5}
-                return {'qdrant': 0.0, 'faiss': 0.0, 'bm25': 1.0}
-            q = (vector / total) if use_q else 0.0
-            f = (vector / total) if use_f else 0.0
-            b = wb / total
-            return {'qdrant': q, 'faiss': f, 'bm25': b}
-        # BM25 미포함: 선택된 벡터=1
-        if use_q:
-            return {'qdrant': 1.0, 'faiss': 0.0, 'bm25': 0.0}
-        if use_f:
-            return {'qdrant': 0.0, 'faiss': 1.0, 'bm25': 0.0}
-        return {'qdrant': 0.0, 'faiss': 0.0, 'bm25': 1.0}
+    # validate_retrievers_and_weights 메서드 제거됨 (Qdrant만 사용)
 
 
 class QueryResponse(BaseModel):
@@ -196,11 +176,12 @@ class QueryResponse(BaseModel):
     
     생성된 답변과 출처 정보를 포함합니다.
     """
-    answer: str = Field(..., description="생성된 답변 텍스트", example="변압기 진단 기준은 다음과 같습니다...")
+    answer: str = Field(..., description="생성된 답변 텍스트", json_schema_extra={"example": "변압기 진단 기준은 다음과 같습니다..."})
     sources: List[Dict[str, Any]] = Field(
         ...,
         description="답변 생성에 사용된 출처 문서 목록. 각 문서는 content, score, metadata 등을 포함합니다.",
-        example=[
+        json_schema_extra={
+            "example": [
             {
                 "content": "변압기 진단 기준...",
                 "score": 0.95,
@@ -208,80 +189,44 @@ class QueryResponse(BaseModel):
                 "chunk_index": 0
             }
         ]
+        }
     )
     confidence: float = Field(
         ...,
         description="답변의 신뢰도 점수 (0.0-1.0). 검색 결과의 평균 점수를 기반으로 계산됩니다.",
         ge=0.0,
         le=1.0,
-        example=0.92
+        json_schema_extra={"example": 0.92}
     )
     processing_time: float = Field(
         ...,
         description="전체 처리 시간 (초). 검색 + 리랭킹 + 답변 생성 시간을 포함합니다.",
-        example=3.45
+        json_schema_extra={"example": 3.45}
     )
-    query: str = Field(..., description="원본 질문", example="변압기 진단 기준은 무엇인가요?")
-    model_used: str = Field(..., description="사용된 LLM 모델명", example="gemma3:4b")
+    query: str = Field(..., description="원본 질문", json_schema_extra={"example": "변압기 진단 기준은 무엇인가요?"})
+    model_used: str = Field(..., description="사용된 LLM 모델명", json_schema_extra={"example": "gemma3:4b"})
     warnings: Optional[List[str]] = Field(
         default_factory=list,
         description="경고 메시지 목록. 예: 리랭커 요청했지만 사용 불가능한 경우",
-        example=["리랭커 사용이 요청되었지만 리랭커가 초기화되지 않았습니다."]
+        json_schema_extra={"example": ["리랭커 사용이 요청되었지만 리랭커가 초기화되지 않았습니다."]}
     )
-
-
-class AgenticExecuteRequest(BaseModel):
-    """
-    Agentic RAG 실행 요청 모델
-    
-    LangGraph 기반 워크플로우 실행을 위한 요청입니다.
-    """
-    question: str = Field(..., description="사용자 질문", example="변압기 진단 기준은 무엇인가요?")
-    session_id: Optional[str] = Field(
-        default=None,
-        description="세션 ID (선택적). 세션 관리를 위해 사용됩니다.",
-        example="session-12345"
+    is_general_answer: bool = Field(
+        default=False,
+        description="일반 질문 답변 여부 (벡터 검색 없이 LLM 직접 답변). True이면 sources가 비어있을 수 있습니다.",
+        json_schema_extra={"example": False}
     )
-    graph: str = Field(
-        default="basic",
-        description="실행할 그래프 타입. 현재는 'basic'만 지원됩니다.",
-        example="basic"
+    is_rag_answer: bool = Field(
+        default=True,
+        description="RAG 답변 여부 (벡터 검색 + LLM 답변). False이면 일반 대화 답변입니다.",
+        json_schema_extra={"example": True}
     )
-    parameters: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="추가 파라미터. 검색 옵션 등을 포함할 수 있습니다.",
-        example={"max_sources": 5, "use_reranker": True}
-    )
-
-
-class AgenticExecuteResponse(BaseModel):
-    """
-    Agentic RAG 실행 결과 모델
-    
-    LangGraph 워크플로우 실행 결과를 포함합니다.
-    """
-    answer: str = Field(..., description="생성된 답변 텍스트", example="변압기 진단 기준은 다음과 같습니다...")
-    sources: List[Dict[str, Any]] = Field(
-        ...,
-        description="검색 결과 문서 목록",
-        example=[{"content": "...", "score": 0.95, "source_file": "..."}]
-    )
-    confidence: float = Field(
-        ...,
-        description="답변의 신뢰도 점수 (0.0-1.0)",
-        ge=0.0,
-        le=1.0,
-        example=0.92
-    )
-    processing_time: float = Field(..., description="전체 처리 시간 (초)", example=4.23)
-    graph_run_id: str = Field(..., description="그래프 실행 ID (고유 식별자)", example="basic-1234567890")
 
 
 class HealthResponse(BaseModel):
     """헬스 체크 응답"""
-    status: str = Field(..., description="서버 상태", example="healthy")
-    timestamp: float = Field(..., description="응답 생성 시각 (Unix timestamp)", example=1234567890.123)
-    version: str = Field(..., description="API 버전", example="1.0.0")
+    status: str = Field(..., description="서버 상태", json_schema_extra={"example": "healthy"})
+    timestamp: float = Field(..., description="응답 생성 시각 (Unix timestamp)", json_schema_extra={"example": 1234567890.123})
+    version: str = Field(..., description="API 버전", json_schema_extra={"example": "1.0.0"})
 
 
 class StatsResponse(BaseModel):
@@ -293,14 +238,14 @@ class StatsResponse(BaseModel):
     embedding_cache_stats: Dict[str, Any] = Field(
         ...,
         description="임베딩 캐시 통계 (캐시 크기, 히트/미스율, 모델 정보 등)",
-        example={"cache_size": 1000, "hits": 500, "misses": 200, "model_name": "BGE-m3-ko", "dimension": 1024}
+        json_schema_extra={"example": {"cache_size": 1000, "hits": 500, "misses": 200, "model_name": "BGE-m3-ko", "dimension": 1024}}
     )
     vector_store_stats: Dict[str, Any] = Field(
         ...,
         description="벡터 저장소 통계 (총 문서 수, 청크 수, 컬렉션 정보 등)",
-        example={"total_documents": 50, "total_chunks": 500, "collection_name": "electrical_diagnosis"}
+        json_schema_extra={"example": {"total_documents": 50, "total_chunks": 500, "collection_name": "electrical_diagnosis"}}
     )
-    llm_model: str = Field(..., description="현재 사용 중인 LLM 모델명", example="gemma3:4b")
+    llm_model: str = Field(..., description="현재 사용 중인 LLM 모델명", json_schema_extra={"example": "gemma3:4b"})
 
 
 class ModelsResponse(BaseModel):
@@ -312,12 +257,14 @@ class ModelsResponse(BaseModel):
     available_models: List[Dict[str, str]] = Field(
         ...,
         description="사용 가능한 모델 목록. 각 모델은 name, size, modified_at, family 정보를 포함합니다.",
-        example=[
+        json_schema_extra={
+            "example": [
             {"name": "gemma3:4b", "size": "2.5GB", "modified_at": "2024-01-01T00:00:00Z", "family": "gemma"},
             {"name": "llama3.1:8b", "size": "4.7GB", "modified_at": "2024-01-01T00:00:00Z", "family": "llama"}
         ]
+        }
     )
-    current_model: str = Field(..., description="현재 사용 중인 모델명", example="gemma3:4b")
+    current_model: str = Field(..., description="현재 사용 중인 모델명", json_schema_extra={"example": "gemma3:4b"})
 
 
 class ConfigResponse(BaseModel):
@@ -326,25 +273,25 @@ class ConfigResponse(BaseModel):
     
     현재 시스템 설정 정보를 포함합니다.
     """
-    llm_model: str = Field(..., description="현재 사용 중인 LLM 모델명", example="gemma3:4b")
-    embedding_model: str = Field(..., description="현재 사용 중인 임베딩 모델명", example="BGE-m3-ko")
-    max_sources: int = Field(..., description="기본 최대 소스 수", example=5)
-    score_threshold: float = Field(..., description="기본 점수 임계값", example=0.7)
-    default_limit: int = Field(..., description="기본 검색 제한값", example=5)
+    llm_model: str = Field(..., description="현재 사용 중인 LLM 모델명", json_schema_extra={"example": "gemma3:4b"})
+    embedding_model: str = Field(..., description="현재 사용 중인 임베딩 모델명", json_schema_extra={"example": "BGE-m3-ko"})
+    max_sources: int = Field(..., description="기본 최대 소스 수", json_schema_extra={"example": 5})
+    score_threshold: float = Field(..., description="기본 점수 임계값", json_schema_extra={"example": 0.7})
+    default_limit: int = Field(..., description="기본 검색 제한값", json_schema_extra={"example": 5})
     reranker_model: Optional[str] = Field(
         default=None,
         description="리랭커 모델 경로 또는 이름",
-        example="ms-marco-MiniLM-L-6-v2"
+        json_schema_extra={"example": "ms-marco-MiniLM-L-6-v2"}
     )
     reranker_enabled: bool = Field(
         default=False,
         description="리랭커 활성화 여부",
-        example=True
+        json_schema_extra={"example": True}
     )
     reranker_alpha: Optional[float] = Field(
         default=None,
         description="리랭커 alpha 값 (0.0-1.0)",
-        example=0.7
+        json_schema_extra={"example": 0.7}
     )
 
 
@@ -354,11 +301,96 @@ class DocumentUploadResponse(BaseModel):
     
     문서 업로드 및 처리 결과를 포함합니다.
     """
-    success: bool = Field(..., description="업로드 성공 여부", example=True)
-    message: str = Field(..., description="응답 메시지", example="3개 파일 처리 완료")
-    processed_files: int = Field(..., description="처리된 파일 수", example=3)
-    total_chunks: int = Field(..., description="생성된 청크 수", example=150)
-    processing_time: float = Field(..., description="처리 시간(초)", example=12.34)
+    success: bool = Field(..., description="업로드 성공 여부", json_schema_extra={"example": True})
+    message: str = Field(..., description="응답 메시지", json_schema_extra={"example": "3개 파일 처리 완료"})
+    processed_files: int = Field(..., description="처리된 파일 수", json_schema_extra={"example": 3})
+    total_chunks: int = Field(..., description="생성된 청크 수", json_schema_extra={"example": 150})
+    processing_time: float = Field(..., description="처리 시간(초)", json_schema_extra={"example": 12.34})
+
+
+# Lifespan 이벤트 핸들러 (Pydantic V2 호환)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """서버 생명주기 관리 (startup/shutdown)"""
+    # Startup
+    global rag_system
+    
+    # 로깅 설정
+    setup_logging()
+    logger = get_logger()
+    
+    logger.info("API 서버 시작 중...")
+    
+    try:
+        # 설정 로드
+        config = get_config()
+        embedding_name = config.model.get('embedding').name if config.model.get('embedding') else 'unknown'
+        llm_name = config.model.get('llm').name if config.model.get('llm') else 'unknown'
+        logger.info(f"설정 로드 완료: 임베딩={embedding_name}, LLM={llm_name}")
+        
+        # RAG 시스템 초기화 (설정 명시적 전달)
+        rag_system = RAGSystem(config)
+        
+        # 벡터 저장소 설정
+        if not rag_system.vector_store.create_collection(force_recreate=False):
+            logger.error("벡터 저장소 설정 실패")
+            raise Exception("벡터 저장소 설정 실패")
+        
+        # Kiwipiepy 전처리 상태 로깅
+        try:
+            # config에서 직접 확인
+            from src.utils.config import get_qdrant_config
+            qdrant_config = get_qdrant_config()
+            config_kiwipiepy_value = qdrant_config.sparse_use_kiwipiepy if hasattr(qdrant_config, 'sparse_use_kiwipiepy') else True
+            logger.info(f"[Kiwipiepy 설정 확인] config.yaml의 sparse_use_kiwipiepy 값: {config_kiwipiepy_value}")
+            
+            kiwipiepy_enabled = rag_system.vector_store.use_kiwipiepy_preprocessing
+            kiwipiepy_dict = rag_system.vector_store.kiwipiepy_dictionary_path
+            kiwipiepy_preprocessor = rag_system.vector_store.kiwipiepy_preprocessor
+            logger.info(f"[Kiwipiepy 상태] vector_store.use_kiwipiepy_preprocessing: {kiwipiepy_enabled}")
+            logger.info(f"[Kiwipiepy 상태] kiwipiepy_preprocessor 존재: {kiwipiepy_preprocessor is not None}")
+            if kiwipiepy_preprocessor:
+                logger.info(f"[Kiwipiepy 상태] kiwipiepy_preprocessor.use_kiwipiepy: {kiwipiepy_preprocessor.use_kiwipiepy}")
+                logger.info(f"[Kiwipiepy 상태] kiwipiepy_preprocessor.kiwi 존재: {kiwipiepy_preprocessor.kiwi is not None}")
+            
+            if kiwipiepy_enabled and kiwipiepy_preprocessor and kiwipiepy_preprocessor.use_kiwipiepy:
+                logger.info(
+                    f"✅ Kiwipiepy 형태소 전처리 활성화 (사전 경로: {kiwipiepy_dict if kiwipiepy_dict else '기본 사전'})"
+                )
+            else:
+                if not kiwipiepy_enabled:
+                    logger.warning(
+                        f"❌ Kiwipiepy 형태소 전처리 비활성화 "
+                        f"(config.yaml의 sparse_use_kiwipiepy={config_kiwipiepy_value}, "
+                        f"vector_store.use_kiwipiepy_preprocessing={kiwipiepy_enabled})"
+                    )
+                elif not kiwipiepy_preprocessor:
+                    logger.warning("❌ Kiwipiepy 형태소 전처리 비활성화 (KiwipiepyPreprocessor 초기화 실패 - Kiwipiepy 설치 확인 필요)")
+                elif not kiwipiepy_preprocessor.use_kiwipiepy:
+                    logger.warning("❌ Kiwipiepy 형태소 전처리 비활성화 (KiwipiepyPreprocessor.use_kiwipiepy = False - Kiwipiepy 설치 또는 초기화 실패)")
+        except Exception as kiwipiepy_log_error:
+            logger.warning(f"Kiwipiepy 전처리 상태 로깅 실패: {kiwipiepy_log_error}")
+            import traceback
+            logger.error(f"상세 오류: {traceback.format_exc()}")
+        
+        # 세션 관리자 초기화 (서버 시작 시점에 초기화하여 SQLite 설정 확인)
+        try:
+            session_manager = get_session_manager()
+            logger.info("세션 관리자 초기화 완료")
+        except Exception as e:
+            logger.warning(f"세션 관리자 초기화 중 오류 발생 (계속 진행): {str(e)}")
+        
+        logger.info("API 서버 시작 완료")
+        
+    except Exception as e:
+        logger.error(f"서버 시작 실패: {str(e)}")
+        raise
+    
+    # Yield로 앱 실행 중 상태 유지
+    yield
+    
+    # Shutdown (필요시 정리 작업)
+    logger.info("API 서버 종료 중...")
 
 
 # FastAPI 앱 생성
@@ -383,7 +415,8 @@ app = FastAPI(
     """,
     version="1.0.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan
 )
 
 # CORS 미들웨어 추가
@@ -394,6 +427,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 메트릭 라우터 포함
+if metrics_router:
+    app.include_router(metrics_router)
 
 # 전역 RAG 시스템 인스턴스
 rag_system: Optional[RAGSystem] = None
@@ -407,37 +444,10 @@ def get_rag_system() -> RAGSystem:
     return rag_system
 
 
-@app.on_event("startup")
-async def startup_event():
-    """서버 시작 시 실행"""
-    global rag_system
-    
-    # 로깅 설정
-    setup_logging()
-    logger = get_logger()
-    
-    logger.info("API 서버 시작 중...")
-    
-    try:
-        # 설정 로드
-        config = get_config()
-        embedding_name = config.model.get('embedding').name if config.model.get('embedding') else 'unknown'
-        llm_name = config.model.get('llm').name if config.model.get('llm') else 'unknown'
-        logger.info(f"설정 로드 완료: 임베딩={embedding_name}, LLM={llm_name}")
-        
-        # RAG 시스템 초기화 (설정 명시적 전달)
-        rag_system = RAGSystem(config)
-        
-        # 벡터 저장소 설정
-        if not rag_system.vector_store_manager.setup_collection():
-            logger.error("벡터 저장소 설정 실패")
-            raise Exception("벡터 저장소 설정 실패")
-        
-        logger.info("API 서버 시작 완료")
-        
-    except Exception as e:
-        logger.error(f"서버 시작 실패: {str(e)}")
-        raise
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Favicon 핸들러 (404 오류 방지)"""
+    return Response(status_code=204)  # No Content
 
 
 @app.get(
@@ -500,25 +510,50 @@ async def health_check():
 async def query(request: QueryRequest, rag: RAGSystem = Depends(get_rag_system)):
     """질의응답 (비동기)"""
     try:
-        # Qdrant만 사용 (FAISS, BM25는 숨김 처리됨)
-        if not request.use_qdrant:
-            raise HTTPException(
-                status_code=400, 
-                detail="Qdrant 검색기는 필수입니다. (FAISS, BM25는 현재 사용할 수 없습니다)"
-            )
+        # Qdrant만 사용 (FAISS, BM25는 제거됨)
+        # use_qdrant 필드는 더 이상 필요 없음 (항상 Qdrant 사용)
         
-        # 검색기 선택 정보 구성
+        # 입력 파라미터 검증
+        if not isinstance(request.question, str) or not request.question.strip():
+            raise HTTPException(status_code=400, detail="question은 비어있지 않은 문자열이어야 합니다.")
+        
+        if request.max_sources is not None and (not isinstance(request.max_sources, int) or request.max_sources < 1):
+            raise HTTPException(status_code=400, detail="max_sources는 1 이상의 정수여야 합니다.")
+        
+        if request.score_threshold is not None and (not isinstance(request.score_threshold, (int, float)) or request.score_threshold < 0.0 or request.score_threshold > 1.0):
+            raise HTTPException(status_code=400, detail="score_threshold는 0.0과 1.0 사이의 값이어야 합니다.")
+        
+        if request.session_id is not None and (not isinstance(request.session_id, str) or not request.session_id.strip()):
+            raise HTTPException(status_code=400, detail="session_id는 비어있지 않은 문자열이어야 합니다.")
+        
+        # 검색기 선택 정보 구성 (Qdrant만 사용)
         retrievers = {
-            'use_qdrant': request.use_qdrant,
-            'use_faiss': request.use_faiss,
-            'use_bm25': request.use_bm25,
-            'use_reranker': request.use_reranker,
-            'reranker_alpha': request.reranker_alpha,
-            'reranker_top_k': request.reranker_top_k,
-            'weights': request.weights or {'qdrant': 1.0, 'faiss': 0.0, 'bm25': 0.0},
-            'dense_weight': request.dense_weight,
-            'sparse_weight': request.sparse_weight
+            'use_qdrant': True,  # Qdrant만 사용
+            'use_reranker': bool(request.use_reranker),
+            'reranker_alpha': float(request.reranker_alpha) if request.reranker_alpha is not None else None,
+            'dense_weight': float(request.dense_weight) if request.dense_weight is not None else None,
+            'sparse_weight': float(request.sparse_weight) if request.sparse_weight is not None else None
         }
+        
+        # 세션에 사용자 메시지 추가
+        if request.session_id:
+            try:
+                session_manager = get_session_manager()
+                if session_manager is None:
+                    logger = get_logger()
+                    logger.warning("세션 관리자를 가져올 수 없습니다. 메시지 저장을 건너뜁니다.")
+                else:
+                    success = session_manager.add_message(
+                        session_id=request.session_id,
+                        role='user',
+                        content=request.question
+                    )
+                    if not success:
+                        logger = get_logger()
+                        logger.warning(f"세션 메시지 추가 실패: {request.session_id}")
+            except Exception as e:
+                logger = get_logger()
+                logger.warning(f"세션 메시지 추가 중 오류 발생 (무시): {str(e)}")
         
         # RAG 시스템을 통한 질의 처리 (비동기 메서드 사용)
         response = await rag.query_async(
@@ -526,8 +561,29 @@ async def query(request: QueryRequest, rag: RAGSystem = Depends(get_rag_system))
             max_sources=request.max_sources,
             score_threshold=request.score_threshold,
             model_name=request.model,
-            retrievers=retrievers
+            retrievers=retrievers,
+            session_id=request.session_id,
+            dense_weight=request.dense_weight,
+            sparse_weight=request.sparse_weight
         )
+        
+        # RAGResponse 검증
+        if response is None:
+            raise HTTPException(status_code=500, detail="RAG 시스템이 응답을 생성하지 못했습니다.")
+        
+        # 필수 필드 검증
+        if not hasattr(response, 'answer') or response.answer is None:
+            raise HTTPException(status_code=500, detail="RAG 응답에 answer 필드가 없습니다.")
+        if not hasattr(response, 'sources') or not isinstance(response.sources, list):
+            raise HTTPException(status_code=500, detail="RAG 응답에 sources 필드가 없거나 리스트가 아닙니다.")
+        if not hasattr(response, 'confidence') or response.confidence is None:
+            raise HTTPException(status_code=500, detail="RAG 응답에 confidence 필드가 없습니다.")
+        if not hasattr(response, 'processing_time') or response.processing_time is None:
+            raise HTTPException(status_code=500, detail="RAG 응답에 processing_time 필드가 없습니다.")
+        if not hasattr(response, 'query') or response.query is None:
+            raise HTTPException(status_code=500, detail="RAG 응답에 query 필드가 없습니다.")
+        if not hasattr(response, 'model_used') or response.model_used is None:
+            raise HTTPException(status_code=500, detail="RAG 응답에 model_used 필드가 없습니다.")
         
         # 리랭커 요청했지만 사용 불가능한 경우 경고 추가
         reranker_requested = request.use_reranker
@@ -536,6 +592,30 @@ async def query(request: QueryRequest, rag: RAGSystem = Depends(get_rag_system))
         if reranker_requested and not reranker_available:
             warnings.append("리랭커 사용이 요청되었지만 리랭커가 초기화되지 않았습니다. config.yaml에서 reranker.enabled: true로 설정하세요.")
         
+        # 세션에 어시스턴트 메시지 추가
+        if request.session_id:
+            try:
+                session_manager = get_session_manager()
+                if session_manager is None:
+                    logger = get_logger()
+                    logger.warning("세션 관리자를 가져올 수 없습니다. 메시지 저장을 건너뜁니다.")
+                else:
+                    success = session_manager.add_message(
+                        session_id=request.session_id,
+                        role='assistant',
+                        content=response.answer,
+                        search_results=response.sources,
+                        model_used=response.model_used,
+                        confidence=response.confidence,
+                        processing_time=response.processing_time
+                    )
+                    if not success:
+                        logger = get_logger()
+                        logger.warning(f"세션 메시지 추가 실패: {request.session_id}")
+            except Exception as e:
+                logger = get_logger()
+                logger.warning(f"세션 메시지 추가 중 오류 발생 (무시): {str(e)}")
+        
         return QueryResponse(
             answer=response.answer,
             sources=response.sources,
@@ -543,75 +623,15 @@ async def query(request: QueryRequest, rag: RAGSystem = Depends(get_rag_system))
             processing_time=response.processing_time,
             query=response.query,
             model_used=response.model_used,
-            warnings=warnings
+            warnings=warnings,
+            is_general_answer=bool(response.is_general_answer) if hasattr(response, 'is_general_answer') else False,
+            is_rag_answer=bool(response.is_rag_answer) if hasattr(response, 'is_rag_answer') else True
         )
         
     except Exception as e:
         logger = get_logger()
         logger.error(f"질의 처리 실패: {str(e)}")
         raise HTTPException(status_code=500, detail=f"질의 처리 실패: {str(e)}")
-
-
-@app.post(
-    "/agentic/execute",
-    response_model=AgenticExecuteResponse,
-    tags=["질의응답"],
-    summary="Agentic RAG 실행 (LangGraph)",
-    description="""
-    LangGraph 기반 Agentic RAG 워크플로우를 실행합니다.
-    
-    ## 기능
-    - 질문 분석 → 검색 실행 → 답변 생성의 단계별 처리
-    - 세션 지원 (선택적)
-    - 동적 파라미터 설정
-    
-    ## 활성화 조건
-    - `config.yaml`의 `feature_flags.langgraph_enabled`가 `true`여야 합니다
-    - LangGraph 모듈이 설치되어 있어야 합니다
-    
-    ## 워크플로우
-    1. **질문 분석**: 사용자 질문의 의도 파악
-    2. **검색 실행**: 다중 검색 전략을 통한 관련 문서 검색
-    3. **답변 생성**: 검색된 문서를 기반으로 최종 답변 생성
-    """,
-    response_description="생성된 답변, 검색 결과, 신뢰도, 처리 시간, 그래프 실행 ID"
-)
-async def agentic_execute(request: AgenticExecuteRequest):
-    """Execute basic LangGraph workflow behind feature flag."""
-    try:
-        config = get_config()
-        feature_flags = getattr(config, 'feature_flags', None) or {}
-        if not feature_flags or not feature_flags.get('langgraph_enabled', False):
-            raise HTTPException(status_code=404, detail="Agentic API is disabled (feature flag: langgraph_enabled=false)")
-
-        try:
-            from src.agentic_rag.workflows.basic_graph import run_basic_graph  # type: ignore
-        except Exception:
-            raise HTTPException(status_code=501, detail="LangGraph is not available")
-
-        start = time.time()
-        out = run_basic_graph(
-            question=request.question,
-            session_id=request.session_id,
-            parameters=request.parameters or {},
-        )
-        elapsed = time.time() - start
-
-        graph_run_id = out.get('graph_run_id', f"basic-{int(time.time()*1000)}")
-        
-        return AgenticExecuteResponse(
-            answer=str(out.get('answer', '')),
-            sources=list(out.get('search_results', []) or []),
-            confidence=float(out.get('confidence', 0.0) or 0.0),
-            processing_time=float(out.get('processing_time', elapsed) or elapsed),
-            graph_run_id=str(graph_run_id),
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger = get_logger()
-        logger.error(f"/agentic/execute 실패: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"agentic execute failed: {str(e)}")
 
 
 @app.post(
@@ -636,13 +656,28 @@ async def process_documents(
 ):
     """문서 처리"""
     try:
+        # 입력 파라미터 검증
+        if not isinstance(input_dir, str) or not input_dir.strip():
+            raise HTTPException(status_code=400, detail="input_dir는 비어있지 않은 문자열이어야 합니다.")
+        
         success = rag.process_and_store_documents(input_dir)
+        
+        # 반환값 검증
+        if success is None:
+            raise HTTPException(status_code=500, detail="문서 처리 결과를 확인할 수 없습니다.")
+        
+        if not isinstance(success, bool):
+            logger = get_logger()
+            logger.warning(f"process_and_store_documents 반환값이 bool이 아닙니다: {type(success)}")
+            success = bool(success)
         
         if success:
             return {"message": "문서 처리 완료", "status": "success"}
         else:
             raise HTTPException(status_code=500, detail="문서 처리 실패")
             
+    except HTTPException:
+        raise
     except Exception as e:
         logger = get_logger()
         logger.error(f"문서 처리 실패: {str(e)}")
@@ -846,11 +881,12 @@ class DocumentInfoResponse(BaseModel):
     
     벡터 저장소에 저장된 문서 목록 정보를 포함합니다.
     """
-    total_documents: int = Field(..., description="총 문서 수", example=50)
+    total_documents: int = Field(..., description="총 문서 수", json_schema_extra={"example": 50})
     documents: List[Dict[str, Any]] = Field(
         ...,
         description="문서 목록. 각 문서는 파일명, 경로, 청크 수, 메타데이터 등을 포함합니다.",
-        example=[
+        json_schema_extra={
+            "example": [
             {
                 "file_name": "transformer_guide.md",
                 "source_file": "data/raw/transformer_guide.md",
@@ -858,12 +894,13 @@ class DocumentInfoResponse(BaseModel):
                 "metadata": {}
             }
         ]
+        }
     )
-    total_chunks: int = Field(..., description="총 청크 수", example=500)
+    total_chunks: int = Field(..., description="총 청크 수", json_schema_extra={"example": 500})
     collection_info: Dict[str, Any] = Field(
         ...,
         description="컬렉션 정보 (컬렉션명, 포인트 수 등)",
-        example={"collection_name": "electrical_diagnosis", "points_count": 500}
+        json_schema_extra={"example": {"collection_name": "electrical_diagnosis", "points_count": 500}}
     )
 
 
@@ -878,21 +915,15 @@ class DocumentDeleteResponse(BaseModel):
     
     문서 삭제 결과 및 각 저장소별 삭제 상태를 포함합니다.
     """
-    success: bool = Field(..., description="삭제 성공 여부", example=True)
-    message: str = Field(..., description="응답 메시지", example="문서 삭제 완료: 10개 청크 삭제됨")
-    deleted_chunks_count: int = Field(default=0, description="삭제된 청크 수", example=10)
-    qdrant_deleted: bool = Field(default=False, description="Qdrant 삭제 성공 여부", example=True)
-    faiss_deleted: bool = Field(default=False, description="FAISS 삭제 성공 여부 (레거시)", example=False)
-    faiss_handled: bool = Field(
-        default=False,
-        description="FAISS 처리 여부. True이면 재구축이 필요할 수 있습니다.",
-        example=True
-    )
-    bm25_deleted: bool = Field(default=False, description="BM25 삭제 성공 여부", example=True)
+    success: bool = Field(..., description="삭제 성공 여부", json_schema_extra={"example": True})
+    message: str = Field(..., description="응답 메시지", json_schema_extra={"example": "문서 삭제 완료: 10개 청크 삭제됨"})
+    deleted_chunks_count: int = Field(default=0, description="삭제된 청크 수", json_schema_extra={"example": 10})
+    qdrant_deleted: bool = Field(default=False, description="Qdrant 삭제 성공 여부", json_schema_extra={"example": True})
+    # FAISS/BM25 관련 필드 제거됨 (Qdrant만 사용)
     warnings: List[str] = Field(
         default_factory=list,
         description="경고 메시지 목록",
-        example=["FAISS 인덱스 재구축이 필요합니다."]
+        json_schema_extra={"example": []}
     )
 
 
@@ -921,16 +952,35 @@ async def get_documents(rag: RAGSystem = Depends(get_rag_system)):
     """벡터 DB에 저장된 문서 목록 조회"""
     try:
         # 벡터 저장소에서 문서 정보 조회
-        collection_info = rag.vector_store_manager.get_collection_info()
+        collection_info = rag.vector_store.get_collection_info()
         
         # 저장된 문서들의 메타데이터 조회
-        documents_info = rag.vector_store_manager.get_documents_info()
+        documents_info = rag.vector_store.get_documents_info()
+        
+        # 응답 검증: documents_info가 리스트인지 확인
+        if not isinstance(documents_info, list):
+            logger = get_logger()
+            logger.error(f"get_documents_info 반환값이 리스트가 아닙니다: {type(documents_info)}")
+            documents_info = []
+        
+        # 각 문서 정보 검증
+        validated_documents = []
+        for doc in documents_info:
+            if isinstance(doc, dict):
+                # source_file이 없거나 비어있으면 건너뛰기
+                source_file = doc.get('source_file', '')
+                if not source_file or source_file.strip() == '' or source_file == 'unknown':
+                    continue
+                validated_documents.append(doc)
+            else:
+                # dict가 아닌 경우도 건너뛰기
+                continue
         
         return DocumentInfoResponse(
-            total_documents=len(documents_info),
-            documents=documents_info,
-            total_chunks=collection_info.get('points_count', 0),
-            collection_info=collection_info
+            total_documents=len(validated_documents),
+            documents=validated_documents,
+            total_chunks=collection_info.get('points_count', 0) if isinstance(collection_info, dict) else 0,
+            collection_info=collection_info if isinstance(collection_info, dict) else {}
         )
         
     except Exception as e:
@@ -964,13 +1014,33 @@ async def get_documents(rag: RAGSystem = Depends(get_rag_system)):
 async def get_document_chunks(document_id: str, rag: RAGSystem = Depends(get_rag_system)):
     """특정 문서의 청크 정보 조회"""
     try:
-        chunks = rag.vector_store_manager.get_document_chunks(document_id)
+        # 입력 검증: document_id가 유효한지 확인
+        if not document_id or document_id.strip() == '':
+            raise HTTPException(status_code=400, detail="document_id는 비어있을 수 없습니다.")
+        
+        if document_id == 'N/A' or document_id.strip() == 'N/A':
+            raise HTTPException(
+                status_code=400, 
+                detail="'N/A'는 유효한 문서 ID가 아닙니다. 검색 결과에서 source_file이 없는 경우입니다."
+            )
+        
+        chunks = rag.vector_store.get_document_chunks(document_id)
+        
+        # 결과 검증: 문서가 존재하는지 확인
+        if not chunks or len(chunks) == 0:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"문서를 찾을 수 없습니다: {document_id}"
+            )
+        
         return {
             "document_id": document_id,
             "total_chunks": len(chunks),
             "chunks": chunks
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger = get_logger()
         logger.error(f"문서 청크 조회 실패: {str(e)}")
@@ -1013,7 +1083,7 @@ async def get_sparse_vocabulary(
 ):
     """Sparse 벡터 Vocabulary 조회"""
     try:
-        vocabulary_info = rag.vector_store_manager.get_sparse_vocabulary(limit, search_token)
+        vocabulary_info = rag.vector_store.get_sparse_vocabulary(limit, search_token)
         return vocabulary_info
         
     except Exception as e:
@@ -1022,37 +1092,226 @@ async def get_sparse_vocabulary(
         raise HTTPException(status_code=500, detail=f"Vocabulary 조회 실패: {str(e)}")
 
 
+@app.get(
+    "/analyze-sparse-quality",
+    tags=["시스템 관리"],
+    summary="Sparse 벡터 DB 품질 분석",
+    description="""
+    Qdrant에 저장된 Sparse 벡터의 품질을 분석합니다.
+    
+    ## 분석 항목
+    - **기본 통계**: 총 포인트 수, Sparse 벡터 포함/미포함 비율
+    - **토큰 통계**: 포인트당 평균 토큰 수, 분포
+    - **가중치 통계**: 평균, 중앙값, 분포
+    - **Vocabulary 통계**: 고유 토큰 수, 빈도 상위 토큰
+    - **품질 평가**: 발견된 문제점 및 개선 제안
+    
+    ## 활용
+    - Sparse 벡터 DB 품질 확인
+    - 데이터 부족 여부 판단
+    - 개선 방향 제시
+    """,
+    response_description="Sparse 벡터 품질 분석 결과"
+)
+async def analyze_sparse_quality(rag: RAGSystem = Depends(get_rag_system)):
+    """Sparse 벡터 DB 품질 분석"""
+    try:
+        quality_report = rag.vector_store.analyze_sparse_quality()
+        return quality_report
+        
+    except Exception as e:
+        logger = get_logger()
+        logger.error(f"Sparse 벡터 품질 분석 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"품질 분석 실패: {str(e)}")
+
+
+@app.get(
+    "/inspect-vectors",
+    tags=["시스템 관리"],
+    summary="벡터 확인 (Dense + Sparse)",
+    description="""
+    저장된 포인트의 Dense와 Sparse 벡터를 확인합니다.
+    
+    ## 사용 방법
+    - **sample_size**: 랜덤 샘플 포인트 수 (기본값: 3)
+    - **point_ids**: 특정 포인트 ID 리스트 (지정 시 sample_size 무시)
+    
+    ## 확인 항목
+    - Dense 벡터: 크기, 미리보기 (처음 5개 값)
+    - Sparse 벡터: 토큰 수, 가중치 수, 미리보기 (처음 10개)
+    - Payload: 메타데이터 정보
+    
+    ## 활용
+    - 업로드한 문서의 벡터 생성 여부 확인
+    - Dense/Sparse 벡터 품질 검증
+    - 특정 포인트의 벡터 구조 확인
+    """,
+    response_description="벡터 확인 결과 (컬렉션 정보, 샘플 포인트의 Dense/Sparse 벡터)"
+)
+async def inspect_vectors(
+    sample_size: int = Query(3, ge=1, le=100, description="확인할 샘플 포인트 수"),
+    point_ids: Optional[str] = Query(None, description="특정 포인트 ID 리스트 (쉼표로 구분)"),
+    rag: RAGSystem = Depends(get_rag_system)
+):
+    """벡터 확인 (Dense + Sparse)"""
+    try:
+        # point_ids 파싱
+        parsed_point_ids = None
+        if point_ids:
+            try:
+                parsed_point_ids = [pid.strip() for pid in point_ids.split(',')]
+            except Exception as e:
+                logger = get_logger()
+                logger.warning(f"point_ids 파싱 실패: {str(e)}, 무시하고 진행")
+        
+        vector_info = rag.vector_store.inspect_vectors(
+            sample_size=sample_size,
+            point_ids=parsed_point_ids
+        )
+        return vector_info
+        
+    except Exception as e:
+        logger = get_logger()
+        logger.error(f"벡터 확인 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"벡터 확인 실패: {str(e)}")
+
+
+@app.post(
+    "/test-vector-creation",
+    tags=["시스템 관리"],
+    summary="테스트 문장 벡터 생성 확인",
+    description="""
+    테스트용 문장을 업로드하여 Dense와 Sparse 벡터가 제대로 생성되는지 확인합니다.
+    
+    ## 사용 방법
+    1. 간단한 문장을 입력
+    2. 자동으로 처리되어 벡터 저장소에 저장
+    3. 생성된 벡터 정보 반환
+    
+    ## 확인 항목
+    - Dense 벡터 생성 여부 및 크기
+    - Sparse 벡터 생성 여부 및 토큰 수
+    - 저장된 포인트 ID
+    """,
+    response_description="벡터 생성 결과 및 확인 정보"
+)
+async def test_vector_creation(
+    text: str = Form(..., description="테스트할 문장", min_length=1, max_length=1000),
+    rag: RAGSystem = Depends(get_rag_system)
+):
+    """테스트 문장 벡터 생성 확인"""
+    try:
+        logger = get_logger()
+        logger.info(f"테스트 벡터 생성 시작: {text[:50]}...")
+        
+        # 임시 파일 생성
+        import tempfile
+        import uuid
+        from pathlib import Path
+        
+        test_id = str(uuid.uuid4())[:8]
+        temp_dir = Path("data/temp_test")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        temp_file = temp_dir / f"test_{test_id}.txt"
+        temp_file.write_text(text, encoding='utf-8')
+        
+        try:
+            # 문서 처리
+            from src.modules.document_processor import DocumentProcessor
+            processor = DocumentProcessor()
+            chunks = processor.process_file(str(temp_file))
+            
+            if not chunks:
+                raise HTTPException(status_code=400, detail="문서 처리 결과가 없습니다.")
+            
+            # 벡터 저장소에 추가 (동기 메서드)
+            import uuid
+            success = rag.vector_store.add_documents(chunks)
+            
+            if not success:
+                raise HTTPException(status_code=500, detail="벡터 저장소에 저장 실패")
+            
+            # chunk_id를 기반으로 point_id 생성 (add_documents와 동일한 로직)
+            point_ids = []
+            for chunk in chunks:
+                if chunk.chunk_id:
+                    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk.chunk_id))
+                else:
+                    point_id = str(uuid.uuid4())
+                point_ids.append(point_id)
+            
+            # 저장된 포인트의 벡터 확인
+            vector_info = rag.vector_store.inspect_vectors(point_ids=point_ids)
+            
+            result = {
+                'success': True,
+                'test_text': text,
+                'chunks_created': len(chunks),
+                'chunk_ids': [chunk.chunk_id for chunk in chunks],
+                'point_ids': point_ids,
+                'vector_info': vector_info,
+                'message': f'{len(chunks)}개 청크가 생성되어 벡터 저장소에 저장되었습니다.'
+            }
+            
+            return result
+            
+        finally:
+            # 임시 파일 삭제
+            try:
+                temp_file.unlink()
+            except Exception:
+                pass
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger = get_logger()
+        logger.error(f"테스트 벡터 생성 실패: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"테스트 벡터 생성 실패: {str(e)}")
+
+
 @app.delete(
     "/documents/{document_id}",
     response_model=DocumentDeleteResponse,
     tags=["문서 관리"],
     summary="문서 삭제",
-    description="""
+    description=    """
     벡터 저장소에서 특정 문서를 삭제합니다.
     
     ## 삭제 범위
-    - **Qdrant**: 벡터 데이터 삭제
-    - **BM25**: BM25 인덱스에서 문서 제거
-    - **FAISS**: FAISS 인덱스 재구축 필요 (자동 처리)
+    - **Qdrant**: 벡터 데이터 삭제 (Dense + Sparse 벡터)
     
     ## 파라미터
     - **document_id**: 삭제할 문서의 source_file 경로
     
     ## 주의사항
     - 문서가 존재하지 않으면 실패 응답을 반환합니다
-    - FAISS 인덱스는 삭제 후 재구축이 필요할 수 있습니다
     - 삭제된 청크 수가 응답에 포함됩니다
+    - 삭제 후 문서 목록이 자동으로 업데이트됩니다
     """,
-    response_description="삭제 성공 여부, 메시지, 삭제된 청크 수, 각 저장소별 삭제 상태"
+    response_description="삭제 성공 여부, 메시지, 삭제된 청크 수, Qdrant 삭제 상태"
 )
 async def delete_document(document_id: str, rag: RAGSystem = Depends(get_rag_system)):
-    """특정 문서 삭제 (Qdrant + BM25 + FAISS)"""
+    """특정 문서 삭제 (Qdrant만 사용, FAISS/BM25 제거됨)"""
     try:
         logger = get_logger()
         logger.info(f"문서 삭제 요청: {document_id}")
         
+        # 입력 파라미터 검증
+        if not isinstance(document_id, str) or not document_id.strip():
+            raise HTTPException(status_code=400, detail="document_id는 비어있지 않은 문자열이어야 합니다.")
+        
+        if document_id == 'N/A' or document_id.strip() == 'N/A':
+            raise HTTPException(
+                status_code=400, 
+                detail="'N/A'는 유효한 문서 ID가 아닙니다. 검색 결과에서 source_file이 없는 경우입니다."
+            )
+        
         # 문서 존재 여부 확인
-        documents_info = rag.vector_store_manager.get_documents_info()
+        documents_info = rag.vector_store.get_documents_info()
         document_exists = any(doc.get('source_file') == document_id for doc in documents_info)
         
         if not document_exists:
@@ -1066,23 +1325,27 @@ async def delete_document(document_id: str, rag: RAGSystem = Depends(get_rag_sys
         # 문서 삭제 실행
         result = rag.delete_document(document_id)
         
-        # 응답 생성
+        # 반환값 검증
+        if result is None:
+            raise HTTPException(status_code=500, detail="문서 삭제 결과를 확인할 수 없습니다.")
+        
+        if not isinstance(result, dict):
+            raise HTTPException(status_code=500, detail=f"delete_document 반환값이 딕셔너리가 아닙니다: {type(result)}")
+        
+        # 응답 생성 (Qdrant만 사용, FAISS/BM25 제거됨)
         qdrant_success = result.get('qdrant_success', result.get('qdrant_deleted', False))
-        bm25_success = result.get('bm25_success', result.get('bm25_deleted', False))
-        faiss_handled = result.get('faiss_handled', False)
+        deleted_chunks_count = result.get('deleted_chunks_count', 0)
         
         if qdrant_success:
-            message = f"문서 삭제 완료: {result.get('deleted_chunks_count', 0)}개 청크 삭제됨"
+            message = f"문서 삭제 완료: {deleted_chunks_count}개 청크 삭제됨"
             if result.get('warnings'):
                 message += f". 경고: {', '.join(result['warnings'])}"
             
             return DocumentDeleteResponse(
                 success=True,
                 message=message,
-                deleted_chunks_count=result.get('deleted_chunks_count', 0),
+                deleted_chunks_count=deleted_chunks_count,
                 qdrant_deleted=qdrant_success,
-                bm25_deleted=bm25_success,
-                faiss_handled=faiss_handled,
                 warnings=result.get('warnings', [])
             )
         else:
@@ -1091,10 +1354,8 @@ async def delete_document(document_id: str, rag: RAGSystem = Depends(get_rag_sys
             return DocumentDeleteResponse(
                 success=False,
                 message=error_message,
-                deleted_chunks_count=result.get('deleted_chunks_count', 0),
+                deleted_chunks_count=deleted_chunks_count,
                 qdrant_deleted=False,
-                bm25_deleted=bm25_success,
-                faiss_handled=faiss_handled,
                 warnings=result.get('warnings', [])
             )
             
@@ -1105,66 +1366,7 @@ async def delete_document(document_id: str, rag: RAGSystem = Depends(get_rag_sys
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"문서 삭제 실패: {str(e)}")
 
-
-@app.post(
-    "/rebuild-indexes",
-    response_model=RebuildIndexesResponse,
-    tags=["인덱스 관리"],
-    summary="인덱스 재구축",
-    description="""
-    FAISS 및 BM25 인덱스를 Qdrant의 기존 문서를 기반으로 재구축합니다.
-    
-    ## 재구축 대상
-    - **FAISS 인덱스**: 벡터 검색 인덱스 재구축
-    - **BM25 인덱스**: 키워드 검색 인덱스 재구축
-    
-    ## 사용 시기
-    - 문서 삭제 후 인덱스 동기화
-    - 인덱스 손상 또는 불일치 발생 시
-    - 대량 문서 업데이트 후 일관성 확보
-    - 하이브리드 검색 정확도 향상을 위해
-    
-    ## 주의사항
-    - 재구축에는 시간이 소요될 수 있습니다 (문서 수에 비례)
-    - 재구축 중에는 검색 성능이 일시적으로 저하될 수 있습니다
-    - Qdrant에 저장된 모든 문서를 기반으로 재구축됩니다
-    """,
-    response_description="재구축 성공 여부, 메시지, 재구축된 청크 수"
-)
-async def rebuild_indexes(rag: RAGSystem = Depends(get_rag_system)):
-    """FAISS 및 BM25 인덱스 재구축 (Qdrant의 기존 문서 사용)"""
-    try:
-        logger = get_logger()
-        logger.info("인덱스 재구축 요청 받음")
-        
-        success = await rag.rebuild_faiss_and_bm25_indexes_async()
-        
-        if success:
-            # 재구축된 청크 수 가져오기
-            stats = rag.get_system_stats()
-            vector_stats = stats.get('vector_store', {})
-            chunks_count = vector_stats.get('total_chunks', None)
-            
-            return RebuildIndexesResponse(
-                success=True,
-                message="인덱스 재구축이 완료되었습니다.",
-                chunks_count=chunks_count
-            )
-        else:
-            return RebuildIndexesResponse(
-                success=False,
-                message="인덱스 재구축에 실패했습니다. 로그를 확인해주세요."
-            )
-            
-    except Exception as e:
-        logger = get_logger()
-        logger.error(f"인덱스 재구축 실패: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise HTTPException(
-            status_code=500,
-            detail=f"인덱스 재구축 실패: {str(e)}"
-        )
+# /rebuild-indexes ?붾뱶?ъ씤???쒓굅??(FAISS/BM25 ?쒓굅)
 
 
 @app.post(
@@ -1200,6 +1402,290 @@ async def clear_cache(rag: RAGSystem = Depends(get_rag_system)):
         raise HTTPException(status_code=500, detail=f"캐시 초기화 실패: {str(e)}")
 
 
+# ==================== 세션 관리 API ====================
+
+@app.get(
+    "/sessions",
+    response_model=SessionListResponse,
+    tags=["세션 관리"],
+    summary="세션 목록 조회",
+    description="""
+    모든 세션 목록을 조회합니다.
+    
+    ## 포함 정보
+    - **session_id**: 세션 ID
+    - **title**: 세션 제목 (첫 사용자 메시지 또는 "새 대화")
+    - **last_message**: 마지막 메시지 미리보기
+    - **created_at**: 생성 시간
+    - **last_accessed**: 마지막 접근 시간
+    - **message_count**: 메시지 수
+    
+    ## 정렬
+    - 최신 순으로 정렬 (last_accessed 기준 내림차순)
+    
+    ## 활용
+    - 사이드바에 세션 목록 표시
+    - 세션 선택 및 전환
+    - 대화 히스토리 관리
+    """,
+    response_description="세션 목록 및 총 개수"
+)
+async def list_sessions():
+    """세션 목록 조회"""
+    try:
+        session_manager = get_session_manager()
+        if session_manager is None:
+            raise HTTPException(status_code=503, detail="세션 관리자를 초기화할 수 없습니다.")
+        
+        sessions_data = session_manager.list_sessions()
+        if sessions_data is None:
+            sessions_data = []
+        
+        if not isinstance(sessions_data, list):
+            logger = get_logger()
+            logger.warning(f"세션 목록이 리스트가 아닙니다: {type(sessions_data)}, 빈 리스트로 변환")
+            sessions_data = []
+        
+        # SessionInfo 리스트로 변환
+        sessions = []
+        for session_data in sessions_data:
+            if not isinstance(session_data, dict):
+                continue
+            
+            try:
+                session_info = SessionInfo(
+                    session_id=session_data.get("session_id", ""),
+                    title=session_data.get("title", "새 대화"),
+                    last_message=session_data.get("last_message", ""),
+                    created_at=float(session_data.get("created_at", 0.0)),
+                    last_accessed=float(session_data.get("last_accessed", 0.0)),
+                    message_count=int(session_data.get("message_count", 0))
+                )
+                sessions.append(session_info)
+            except Exception as e:
+                logger = get_logger()
+                logger.warning(f"세션 정보 변환 실패: {str(e)}, 건너뜀")
+                continue
+        
+        return SessionListResponse(
+            sessions=sessions,
+            total_count=len(sessions)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger = get_logger()
+        logger.error(f"세션 목록 조회 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"세션 목록 조회 실패: {str(e)}")
+
+
+@app.post(
+    "/sessions",
+    response_model=SessionCreateResponse,
+    tags=["세션 관리"],
+    summary="세션 생성",
+    description="""
+    새로운 대화 세션을 생성합니다.
+    
+    ## 기능
+    - 고유한 세션 ID 생성
+    - 세션 메모리 캐시 초기화
+    - 세션 TTL 설정
+    
+    ## 응답
+    - **session_id**: 생성된 세션 ID (향후 요청에 사용)
+    
+    ## 활용
+    - 멀티턴 대화 시작
+    - 대화 히스토리 관리
+    - 컨텍스트 유지
+    """,
+    response_description="생성된 세션 ID"
+)
+async def create_session(session_id: Optional[str] = Query(None, description="세션 ID (선택적, 없으면 자동 생성)")):
+    """세션 생성"""
+    try:
+        session_manager = get_session_manager()
+        if session_manager is None:
+            raise HTTPException(status_code=503, detail="세션 관리자를 초기화할 수 없습니다.")
+        
+        session = session_manager.create_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=500, detail="세션 생성에 실패했습니다.")
+        
+        if not hasattr(session, 'session_id') or session.session_id is None:
+            raise HTTPException(status_code=500, detail="생성된 세션에 session_id가 없습니다.")
+        
+        return SessionCreateResponse(session_id=session.session_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger = get_logger()
+        logger.error(f"세션 생성 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"세션 생성 실패: {str(e)}")
+
+
+@app.get(
+    "/sessions/{session_id}/history",
+    response_model=SessionHistoryResponse,
+    tags=["세션 관리"],
+    summary="세션 히스토리 조회",
+    description="""
+    특정 세션의 대화 히스토리를 조회합니다.
+    
+    ## 파라미터
+    - **session_id**: 조회할 세션 ID
+    - **limit**: 반환할 최대 메시지 수 (선택적, 기본값: 전체)
+    
+    ## 포함 정보
+    - 세션 ID
+    - 메시지 히스토리 (역순, 최신 메시지가 마지막)
+    - 각 메시지의 역할, 내용, 타임스탬프
+    
+    ## 활용
+    - 대화 내용 확인
+    - 컨텍스트 복원
+    - 대화 분석
+    """,
+    response_description="세션 ID 및 메시지 히스토리"
+)
+async def get_session_history(session_id: str, limit: Optional[int] = None):
+    """세션 히스토리 조회"""
+    try:
+        session_manager = get_session_manager()
+        if session_manager is None:
+            raise HTTPException(status_code=503, detail="세션 관리자를 초기화할 수 없습니다.")
+        
+        history = session_manager.get_history(session_id, limit=limit)
+        if history is None:
+            logger = get_logger()
+            logger.warning(f"세션 히스토리가 None입니다: {session_id}, 빈 리스트로 반환")
+            history = []
+        
+        if not isinstance(history, list):
+            logger = get_logger()
+            logger.warning(f"세션 히스토리가 리스트가 아닙니다: {type(history)}, 빈 리스트로 변환")
+            history = []
+        
+        # Pydantic 검증을 위해 명시적으로 리스트로 변환
+        history_list = list(history) if history else []
+        
+        return SessionHistoryResponse(session_id=session_id, history=history_list)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger = get_logger()
+        logger.error(f"세션 히스토리 조회 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"세션 히스토리 조회 실패: {str(e)}")
+
+
+@app.delete(
+    "/sessions/{session_id}",
+    tags=["세션 관리"],
+    summary="세션 삭제",
+    description="""
+    특정 세션을 삭제합니다.
+    
+    ## 파라미터
+    - **session_id**: 삭제할 세션 ID
+    
+    ## 삭제 범위
+    - 세션 메모리 캐시
+    - 세션 히스토리
+    - 세션 관련 모든 데이터
+    
+    ## 활용
+    - 세션 정리
+    - 메모리 관리
+    - 개인정보 보호
+    """,
+    response_description="삭제 성공 여부 및 메시지"
+)
+async def delete_session(session_id: str):
+    """세션 삭제"""
+    try:
+        session_manager = get_session_manager()
+        if session_manager is None:
+            raise HTTPException(status_code=503, detail="세션 관리자를 초기화할 수 없습니다.")
+        
+        # 세션 존재 여부 확인
+        session = session_manager.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"세션을 찾을 수 없습니다: {session_id}")
+        
+        result = session_manager.delete_session(session_id)
+        if result:
+            return {"message": f"세션 {session_id}가 삭제되었습니다.", "status": "success"}
+        else:
+            raise HTTPException(status_code=500, detail=f"세션 삭제에 실패했습니다: {session_id}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger = get_logger()
+        logger.error(f"세션 삭제 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"세션 삭제 실패: {str(e)}")
+
+
+@app.get(
+    "/sessions/stats",
+    response_model=SessionStatsResponse,
+    tags=["세션 관리"],
+    summary="세션 통계 조회",
+    description="""
+    전체 세션 통계 정보를 조회합니다.
+    
+    ## 포함 정보
+    - **total_sessions**: 총 세션 수
+    - **total_memory_mb**: 전체 메모리 사용량 (MB)
+    - **oldest_session_age**: 가장 오래된 세션 연령 (초)
+    - **newest_session_age**: 가장 최근 세션 연령 (초)
+    - **active_sessions**: 활성 세션 수
+    
+    ## 활용
+    - 시스템 모니터링
+    - 메모리 사용량 확인
+    - 세션 관리 최적화
+    """,
+    response_description="세션 통계 정보"
+)
+async def get_session_stats():
+    """세션 통계 조회"""
+    try:
+        session_manager = get_session_manager()
+        if session_manager is None:
+            raise HTTPException(status_code=503, detail="세션 관리자를 초기화할 수 없습니다.")
+        
+        stats = session_manager.get_stats()
+        if stats is None:
+            raise HTTPException(status_code=500, detail="세션 통계를 가져올 수 없습니다.")
+        
+        # SessionStats 필드 검증
+        if not hasattr(stats, 'total_sessions'):
+            raise HTTPException(status_code=500, detail="세션 통계에 total_sessions 필드가 없습니다.")
+        if not hasattr(stats, 'total_memory_mb'):
+            raise HTTPException(status_code=500, detail="세션 통계에 total_memory_mb 필드가 없습니다.")
+        if not hasattr(stats, 'oldest_session_age'):
+            raise HTTPException(status_code=500, detail="세션 통계에 oldest_session_age 필드가 없습니다.")
+        if not hasattr(stats, 'newest_session_age'):
+            raise HTTPException(status_code=500, detail="세션 통계에 newest_session_age 필드가 없습니다.")
+        if not hasattr(stats, 'active_sessions'):
+            raise HTTPException(status_code=500, detail="세션 통계에 active_sessions 필드가 없습니다.")
+        
+        return SessionStatsResponse(
+            total_sessions=int(stats.total_sessions) if stats.total_sessions is not None else 0,
+            total_memory_mb=float(stats.total_memory_mb) if stats.total_memory_mb is not None else 0.0,
+            oldest_session_age=float(stats.oldest_session_age) if stats.oldest_session_age is not None else 0.0,
+            newest_session_age=float(stats.newest_session_age) if stats.newest_session_age is not None else 0.0,
+            active_sessions=int(stats.active_sessions) if stats.active_sessions is not None else 0
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger = get_logger()
+        logger.error(f"세션 통계 조회 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"세션 통계 조회 실패: {str(e)}")
+
+
 class ReloadModelRequest(BaseModel):
     """
     모델 재로드 요청 모델
@@ -1209,12 +1695,12 @@ class ReloadModelRequest(BaseModel):
     model_type: str = Field(
         ...,
         description="모델 타입: 'embedding' 또는 'reranker'",
-        example="embedding"
+        json_schema_extra={"example": "embedding"}
     )
     config: Optional[Dict[str, Any]] = Field(
         default=None,
         description="새로운 모델 설정 (선택적). None이면 설정 파일의 기본 설정 사용",
-        example={"model_path": "./models/new_embedding_model", "device": "cuda"}
+        json_schema_extra={"example": {"model_path": "./models/new_embedding_model", "device": "cuda"}}
     )
 
 
@@ -1224,18 +1710,18 @@ class ReloadModelResponse(BaseModel):
     
     모델 재로드 결과 및 이전/새 모델 정보를 포함합니다.
     """
-    success: bool = Field(..., description="재로드 성공 여부", example=True)
-    message: str = Field(..., description="응답 메시지", example="임베딩 모델 재로드 완료")
-    model_type: str = Field(..., description="재로드된 모델 타입", example="embedding")
+    success: bool = Field(..., description="재로드 성공 여부", json_schema_extra={"example": True})
+    message: str = Field(..., description="응답 메시지", json_schema_extra={"example": "임베딩 모델 재로드 완료"})
+    model_type: str = Field(..., description="재로드된 모델 타입", json_schema_extra={"example": "embedding"})
     old_model: Optional[str] = Field(
         default=None,
         description="이전 모델 이름 또는 경로",
-        example="BGE-m3-ko"
+        json_schema_extra={"example": "BGE-m3-ko"}
     )
     new_model: Optional[str] = Field(
         default=None,
         description="새 모델 이름 또는 경로",
-        example="new-embedding-model"
+        json_schema_extra={"example": "new-embedding-model"}
     )
 
 
@@ -1445,7 +1931,7 @@ async def upload_documents(
             chunks = rag.document_processor.process_file(file_path, force_process=True)
             if chunks:
                 # 같은 이름의 파일이 이미 존재하는지 확인
-                existing_documents = rag.vector_store_manager.get_documents_info()
+                existing_documents = rag.vector_store.get_documents_info()
                 
                 # 상세 로그: 기존 문서 목록 출력
                 logger.info(f"기존 문서 목록 ({len(existing_documents)}개):")
@@ -1465,13 +1951,13 @@ async def upload_documents(
                 logger.info(f"최종 교체 모드 결정: {should_replace} (교체모드체크박스: {replace_mode} OR 파일존재: {file_exists})")
                 
                 if should_replace:
-                    success = rag.vector_store_manager.replace_document_vectors(str(file_path), chunks)
+                    success = rag.vector_store.replace_document_vectors(str(file_path), chunks)
                     if file_exists:
                         logger.info(f"같은 이름의 파일 발견, 교체 모드로 처리: {file.filename}")
                     else:
                         logger.info(f"교체 모드로 처리: {file.filename}")
                 else:
-                    success = rag.vector_store_manager.add_chunks(chunks, force_update)
+                    success = rag.vector_store.add_documents(chunks, force_update)
                     logger.info(f"증분 업데이트 모드로 처리: {file.filename}")
                 
                 if success:
@@ -1483,107 +1969,9 @@ async def upload_documents(
             else:
                 logger.warning(f"처리할 청크가 없음: {file.filename}")
         
-        # 모든 파일 처리 후 FAISS 및 BM25 인덱스 확인, 검증 및 EnsembleRetriever 재초기화
+        # 모든 파일 처리 완료 (Qdrant Dense+Sparse만 사용)
         if processed_files > 0:
-            logger.info("FAISS 및 BM25 인덱스 상태 확인 및 검증 중...")
-            
-            # 현재 FAISS 인덱스 상태 확인
-            langchain_manager = rag.vector_store_manager.langchain_retrieval_manager
-            if langchain_manager:
-                # FAISS 인덱스가 없으면 전체 문서에서 재구축
-                if langchain_manager.faiss_store is None:
-                    logger.info("FAISS 인덱스가 없습니다. 재구축을 시작합니다...")
-                    rebuild_success = await rag.rebuild_faiss_and_bm25_indexes_async()
-                    if rebuild_success:
-                        logger.info("FAISS 및 BM25 인덱스 재구축 완료")
-                    else:
-                        logger.warning("FAISS 및 BM25 인덱스 재구축 실패")
-                # BM25Retriever가 없으면 구축
-                elif langchain_manager.bm25_retriever is None:
-                    logger.info("BM25 인덱스가 없습니다. 전체 문서에서 구축합니다...")
-                    # Qdrant에서 모든 청크 가져오기
-                    all_chunks_data = []
-                    documents_info = rag.vector_store_manager.get_documents_info()
-                    for doc_info in documents_info:
-                        source_file = doc_info.get('source_file', '')
-                        if source_file:
-                            chunks_data = rag.vector_store_manager.get_document_chunks(source_file)
-                            all_chunks_data.extend(chunks_data)
-                    
-                    if all_chunks_data:
-                        # DocumentChunk로 변환
-                        from src.modules.document_processor import DocumentChunk
-                        chunks = []
-                        for chunk_data in all_chunks_data:
-                            content = chunk_data.get('content_full', '')
-                            if not content:
-                                content = chunk_data.get('content_preview', '')
-                            
-                            metadata = chunk_data.get('metadata', {})
-                            source_file = (
-                                metadata.get('source_file') or 
-                                metadata.get('file_path') or
-                                chunk_data.get('source_file', '')
-                            )
-                            
-                            chunk = DocumentChunk(
-                                content=content,
-                                metadata=metadata,
-                                chunk_id=chunk_data.get('chunk_id', ''),
-                                source_file=source_file,
-                                chunk_index=chunk_data.get('chunk_index', 0)
-                            )
-                            chunks.append(chunk)
-                        
-                        # BM25 구축
-                        bm25_success = langchain_manager.initialize_bm25_from_chunks(chunks)
-                        if bm25_success:
-                            logger.info("BM25 인덱스 구축 완료")
-                        else:
-                            logger.warning("BM25 인덱스 구축 실패")
-                else:
-                    logger.info("FAISS 및 BM25 인덱스가 이미 존재합니다.")
-                
-                # 인덱스 일관성 검증
-                qdrant_stats = rag.vector_store_manager.get_stats()
-                qdrant_doc_count = qdrant_stats.get('points_count', None)
-                
-                validation_result = langchain_manager.validate_indexes(qdrant_doc_count)
-                
-                if validation_result['warnings']:
-                    for warning in validation_result['warnings']:
-                        logger.warning(warning)
-                    logger.info("인덱스 재구축을 권장합니다. /rebuild-indexes API를 사용하세요.")
-                else:
-                    logger.info("인덱스 일관성 검증 완료")
-                    if validation_result['faiss_available']:
-                        logger.info(f"  - FAISS: {validation_result['faiss_document_count']}개 문서")
-                    if validation_result['bm25_available']:
-                        logger.info(f"  - BM25: {validation_result['bm25_document_count']}개 문서")
-                    if qdrant_doc_count is not None:
-                        logger.info(f"  - Qdrant: {qdrant_doc_count}개 문서")
-                
-                # EnsembleRetriever 재초기화 (인덱스 업데이트 반영)
-                if validation_result['faiss_available'] and validation_result['bm25_available']:
-                    try:
-                        from src.utils.config import get_qdrant_config
-                        qdrant_config = get_qdrant_config()
-                        faiss_weight = qdrant_config.hybrid_search_vector_weight if hasattr(qdrant_config, 'hybrid_search_vector_weight') else 0.7
-                        bm25_weight = qdrant_config.hybrid_search_bm25_weight if hasattr(qdrant_config, 'hybrid_search_bm25_weight') else 0.3
-                        rrf_c = qdrant_config.hybrid_search_rrf_k if hasattr(qdrant_config, 'hybrid_search_rrf_k') else 60
-                        
-                        ensemble_created = langchain_manager.create_ensemble_retriever(
-                            faiss_weight=faiss_weight,
-                            bm25_weight=bm25_weight,
-                            c=rrf_c,
-                            k=rag.rag_config.default_max_sources
-                        )
-                        if ensemble_created:
-                            logger.info("EnsembleRetriever 재초기화 완료 (업로드된 문서 반영)")
-                        else:
-                            logger.warning("EnsembleRetriever 재초기화 실패")
-                    except Exception as e:
-                        logger.warning(f"EnsembleRetriever 재초기화 실패: {str(e)}")
+            logger.info(f"문서 처리 완료: {processed_files}개 파일, {total_chunks}개 청크")
         
         processing_time = time.time() - start_time
         
@@ -1643,12 +2031,31 @@ async def process_directory(
         logger.info(f"디렉토리 처리 시작: {directory_path}")
         
         # 문서 처리 (비동기)
+        # 입력 파라미터 검증
+        if not isinstance(directory_path, str) or not directory_path.strip():
+            raise HTTPException(status_code=400, detail="directory_path는 비어있지 않은 문자열이어야 합니다.")
+        
+        if not isinstance(force_update, bool):
+            force_update = bool(force_update)
+        
+        if not isinstance(replace_mode, bool):
+            replace_mode = bool(replace_mode)
+        
         success = await rag.process_and_store_documents_async(directory_path, force_update, replace_mode)
+        
+        # 반환값 검증
+        if success is None:
+            raise HTTPException(status_code=500, detail="문서 처리 결과를 확인할 수 없습니다.")
+        
+        if not isinstance(success, bool):
+            logger = get_logger()
+            logger.warning(f"process_and_store_documents_async 반환값이 bool이 아닙니다: {type(success)}")
+            success = bool(success)
         
         processing_time = time.time() - start_time
         
         if success:
-            stats = rag.vector_store_manager.get_stats()
+            stats = rag.vector_store.get_collection_info()
             return {
                 "success": True,
                 "message": "디렉토리 처리 완료",

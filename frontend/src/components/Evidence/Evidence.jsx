@@ -110,7 +110,7 @@ export default function Evidence() {
           <div className="evidence-header">
             <div className="evidence-question">질문: {safeQuestion}</div>
             <div className="evidence-answer">답변: {safeAnswer}</div>
-            <div style={{ marginTop: '15px', fontSize: '0.9em', color: '#666' }}>
+            <div style={{ marginTop: '15px', fontSize: '0.9em', color: '#8e8ea0' }}>
               신뢰도: {confidence}% | 처리시간: {processingTime}초 | 모델: {safeModel}
             </div>
           </div>
@@ -118,7 +118,7 @@ export default function Evidence() {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
               <h3>📚 답변 근거 문서들 ({evidence.sources?.length || 0}개)</h3>
               {evidence.sources && evidence.sources.length > 0 && (
-                <div style={{ fontSize: '0.9em', color: '#6c757d' }}>
+                <div style={{ fontSize: '0.9em', color: '#4ade80', fontWeight: '500' }}>
                   평균 관련도: {(
                     evidence.sources.reduce((sum, s) => sum + (s.relevance_score || s.score || 0), 0) / evidence.sources.length * 100
                   ).toFixed(1)}%
@@ -129,7 +129,7 @@ export default function Evidence() {
               <div>
                 {/* 관련도별 정렬 옵션 */}
                 <div style={{ marginBottom: '12px', display: 'flex', gap: '8px', alignItems: 'center' }}>
-                  <span style={{ fontSize: '0.9em', color: '#6c757d' }}>정렬:</span>
+                  <span style={{ fontSize: '0.9em', color: '#8e8ea0' }}>정렬:</span>
                   <select
                     id="sourceSort"
                     onChange={(e) => {
@@ -144,12 +144,15 @@ export default function Evidence() {
                     style={{
                       padding: '4px 8px',
                       fontSize: '0.85em',
-                      border: '1px solid #dee2e6',
+                      background: '#343541',
+                      color: '#ececf1',
+                      border: '1px solid #565869',
                       borderRadius: '4px',
+                      outline: 'none',
                     }}
                   >
-                    <option value="desc">관련도 높은 순</option>
-                    <option value="asc">관련도 낮은 순</option>
+                    <option value="desc" style={{ background: '#343541', color: '#ececf1' }}>관련도 높은 순</option>
+                    <option value="asc" style={{ background: '#343541', color: '#ececf1' }}>관련도 낮은 순</option>
                   </select>
                 </div>
                 {evidence.sources.map((source, index) => (
@@ -162,7 +165,7 @@ export default function Evidence() {
                 ))}
               </div>
             ) : (
-              <div style={{ padding: '20px', textAlign: 'center', color: '#6c757d' }}>
+              <div style={{ padding: '20px', textAlign: 'center', color: '#8e8ea0' }}>
                 근거 문서가 없습니다.
               </div>
             )}
@@ -184,23 +187,23 @@ export default function Evidence() {
               <div className="modal-chunk-info">
                 {selectedSource.source_file && (
                   <>
-                    <strong>파일:</strong> {selectedSource.source_file.split('\\').pop()?.split('/').pop() || selectedSource.source_file}
+                    <strong>파일:</strong> <span style={{ color: '#8e8ea0' }}>{selectedSource.source_file.split('\\').pop()?.split('/').pop() || selectedSource.source_file}</span>
                     <br />
                   </>
                 )}
                 {selectedSource.source_path && (
                   <>
-                    <strong>경로:</strong> {selectedSource.source_path}
+                    <strong>경로:</strong> <span style={{ color: '#8e8ea0' }}>{selectedSource.source_path}</span>
                     <br />
                   </>
                 )}
-                <strong>청크 인덱스:</strong> {selectedSource.chunk_index ?? 'N/A'}
+                <strong>청크 인덱스:</strong> <span style={{ color: '#8e8ea0' }}>{selectedSource.chunk_index ?? 'N/A'}</span>
                 <br />
-                <strong>관련도:</strong> {((selectedSource.relevance_score || 0) * 100).toFixed(1)}%
+                <strong>관련도:</strong> <span style={{ color: '#4ade80', fontWeight: '500' }}>{((selectedSource.relevance_score || 0) * 100).toFixed(1)}%</span>
                 {selectedSource.metadata?.chunk_id && (
                   <>
                     <br />
-                    <strong>청크 ID:</strong> {selectedSource.metadata.chunk_id}
+                    <strong>청크 ID:</strong> <span style={{ color: '#8e8ea0' }}>{selectedSource.metadata.chunk_id}</span>
                   </>
                 )}
               </div>
@@ -211,7 +214,7 @@ export default function Evidence() {
                 </div>
               ) : (
                 <div className="full-chunk-content">
-                  <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                  <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: '#ececf1', margin: 0, padding: 0 }}>
                     {fullContent || selectedSource.content}
                   </pre>
                 </div>

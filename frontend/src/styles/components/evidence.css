@@ -42,6 +42,20 @@
   font-size: 0.9em;
 }
 
+.evidence-question {
+  font-size: 1.3em;
+  font-weight: bold;
+  margin-bottom: 10px;
+  color: #ececf1;
+}
+
+.evidence-answer {
+  font-size: 1.1em;
+  line-height: 1.6;
+  color: #ececf1;
+  margin-bottom: 10px;
+}
+
 .evidence-empty {
   text-align: center;
   padding: 60px 20px;
@@ -108,7 +122,7 @@
   background: #2d2d3a;
   border-radius: 6px;
   font-size: 0.9em;
-  color: #10a37f;
+  color: #4ade80;
   font-weight: 500;
 }
 
@@ -271,5 +285,37 @@
 
 .evidence-modal-content tr:hover {
   background: #343541;
+}
+
+.modal-chunk-info {
+  padding: 15px;
+  background: #2d2d3a;
+  border-radius: 6px;
+  border: 1px solid #565869;
+  margin-bottom: 15px;
+  color: #ececf1;
+  font-size: 0.9em;
+  line-height: 1.8;
+}
+
+.modal-chunk-info strong {
+  color: #ececf1;
+  margin-right: 8px;
+}
+
+.full-chunk-content {
+  background: #2d2d3a;
+  padding: 15px;
+  border-radius: 6px;
+  border: 1px solid #565869;
+}
+
+.full-chunk-content pre {
+  background: #2d2d3a;
+  color: #ececf1;
+  margin: 0;
+  padding: 0;
+  border: none;
+  font-family: inherit;
 }
 

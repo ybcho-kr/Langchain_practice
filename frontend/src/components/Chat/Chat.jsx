@@ -620,7 +620,7 @@ export default function Chat() {
                     }}
                   />
                   <div className="api-mode-option-content">
-                    <strong>Agentic</strong>
+                    <strong>Agentic[진행중]</strong>
                     <p>LangGraph 기반 에이전트로 더 지능적이고 맥락을 고려한 답변을 제공합니다.</p>
                   </div>
                 </label>
