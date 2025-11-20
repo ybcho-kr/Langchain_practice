@@ -31,9 +31,21 @@ def document_chunk_to_langchain_document(chunk: DocumentChunk) -> Document:
     """
     # 메타데이터에 chunk_id와 source_file 추가
     metadata = chunk.metadata.copy()
-    metadata['chunk_id'] = chunk.chunk_id
-    metadata['source_file'] = chunk.source_file
-    metadata['chunk_index'] = chunk.chunk_index
+    metadata.update({
+        'chunk_id': chunk.chunk_id,
+        'source_file': chunk.source_file,
+        'chunk_index': chunk.chunk_index,
+        'doc_id': chunk.doc_id,
+        'section_id': chunk.section_id,
+        'chunk_type': chunk.chunk_type,
+        'heading_path': chunk.heading_path,
+        'page_start': chunk.page_start,
+        'page_end': chunk.page_end,
+        'language': chunk.language,
+        'domain': chunk.domain,
+        'embedding_version': chunk.embedding_version,
+        'document': chunk.doc_metadata.to_dict() if chunk.doc_metadata else None,
+    })
     
     return Document(
         page_content=chunk.content,
